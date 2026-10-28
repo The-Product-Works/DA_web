@@ -4,10 +4,9 @@ The dashboard stage (Milestone 5) shows the pipeline's results in Metabase. It r
 
 | Piece | Where |
 |---|---|
-| Metabase (JAR + portable Java 21) | `%USERPROFILE%\metabase-local\` → http://localhost:3000 |
-| Start script | `metabase/start_metabase.cmd` |
-| Build script | `scripts/build_metabase_dashboard.py` (creates everything through the Metabase API) |
-| Settings (optional) | `%USERPROFILE%\metabase-local\dashboard.env` (template: `metabase/dashboard.env.example`). Use it to skip typing the login, to pick one of several databases (`MB_DATABASE`), or to let the script set up a fresh Metabase and its database connection by itself |
+| Metabase | Docker, from `setup/metabase/docker-compose.yml` → http://localhost:3000 |
+| Dashboard | built by hand in the Metabase UI (steps in [README.md](README.md)); an automated build script is not part of this repo |
+| Settings (optional) | `setup/metabase/dashboard.env.example`, a reference for the connection values a build script would need |
 
 ---
 
@@ -49,7 +48,7 @@ Every card is a SQL question: open it to show the audience the query behind a nu
 
 ## 2. Setup (once)
 
-1. **Read-only login in Supabase.** In the SQL editor (after `scripts/transform_tables.sql`):
+1. **Read-only login in Supabase.** In the SQL editor (after `setup/sql/cleaning_04_transform_tables.sql`):
 
    ```sql
    create role metabase_reader login password 'choose-one' in role analytics_reader;
@@ -57,17 +56,11 @@ Every card is a SQL question: open it to show the audience the query behind a nu
 
    Through the Session pooler its user name is `metabase_reader.<project-ref>`. It can read `analytics.*` and `ops.agent_logs` and nothing else.
 
-2. **Start Metabase:** double-click `metabase\start_metabase.cmd` (or run it in a terminal). The first start takes 1–2 minutes. It is ready when the log shows `Metabase Initialization COMPLETE` and http://localhost:3000 opens.
+2. **Start Metabase:** from `setup/metabase/`, run `docker compose up -d`. The first start takes 1–2 minutes; it is ready when http://localhost:3000 opens.
 
 3. **Set up Metabase in the browser** (admin account), and add the Supabase database under *Admin → Databases* with the `metabase_reader` login from step 1 (Session pooler host, port 5432, database `postgres`). Include at least the schemas `analytics` and `ops`.
 
-4. **Build the dashboard** in a terminal:
-
-   ```
-   python -I scripts\build_metabase_dashboard.py
-   ```
-
-   It asks for your Metabase login, because the script talks to Metabase's API as a separate program and has to log in like any user. The login isn't stored. It finds the database connection that has `analytics.kpi_summary`, saves the 33 questions, lays out both dashboards and then runs every question once. It ends with one `ok` line per question and the dashboard link. Run it again whenever you change the script: everything is found by name and updated in place, so links and the dashboard URL stay the same.
+4. **Build the dashboard** by hand in the Metabase UI, following [README.md](README.md) (sections on cards and the drill-down dashboard). Questions and layout are described in the sections above.
 
 ---
 
@@ -88,10 +81,10 @@ Don't edit the cards the script made in the UI. The next script run overwrites t
 
 - **The data is only as fresh as the last transformation run.** Check the *Data as of* card. If a transformation run failed (FR-T4), nothing was published and the dashboard keeps showing the last complete run. That is a good demo moment. The failure is visible in the activity panel.
 - **Caching:** Metabase may show a result it fetched a few minutes ago. After a manual pipeline run, refresh the dashboard (↻ at the top right).
-- **Orders without a purchase date** are left out of the monthly trends only, so the trend adds up to slightly less than the Revenue tile. `n8n/TRANSFORMATION.md` section 3 explains why.
+- **Orders without a purchase date** are left out of the monthly trends only, so the trend adds up to slightly less than the Revenue tile. [TRANSFORMATION.md](../docs/TRANSFORMATION.md) section 3 explains why.
 - **(unknown) state:** orders whose customer was quarantined during cleaning. They are kept so the states add up to the total.
 - **Pooler user name:** `metabase_reader.<project-ref>`, not just `metabase_reader`. Without the suffix the pooler refuses the login with "Tenant or user not found".
-- **Metabase's own data** (users, questions, dashboards) is in `%USERPROFILE%\metabase-local\metabase.db.mv.db`. Copy that file to back it up, or run the script on a fresh Metabase to rebuild everything.
-- **Insight cards are empty** until the Explain workflow has run (`n8n/EXPLAIN.md`). Run the build script again after `scripts/insights_tables.sql`, so Metabase sees the new tables.
-- **Click-through not tested yet:** the click behaviors (month → filter, cause → drill-down) are set through the API and have not been tried in this Metabase version. If a click does nothing, set them by hand: *Edit dashboard → the card's ⋯ → Click behavior*. A cause with an empty `f_*` column should leave that drill-down filter empty; check that it does not filter on an empty value.
+- **Metabase's own data** (users, questions, dashboards) is stored in the `olist_metabase_data` Docker volume. Back that volume up before upgrades or resets.
+- **Insight cards are empty** until the Explain workflow has run ([EXPLAIN.md](../docs/EXPLAIN.md)). After running `setup/sql/insights_tables.sql`, sync the database schema in Metabase so it sees the new tables.
+- **Click-through not tested yet:** the click behaviors (month → filter, cause → drill-down) have not been tried in this Metabase version. If a click does nothing, set them by hand: *Edit dashboard → the card's ⋯ → Click behavior*. A cause with an empty `f_*` column should leave that drill-down filter empty; check that it does not filter on an empty value.
 - **Next step:** the chat Q&A uses the same `analytics_reader` rights.

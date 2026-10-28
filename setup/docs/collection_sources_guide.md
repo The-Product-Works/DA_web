@@ -2,9 +2,9 @@
 
 This guide covers how the nine messy Olist datasets reach Supabase through the n8n collection workflow (Milestone 2). It explains where each file lives, which n8n nodes read it, which raw table it lands in, and what to watch for given the data's size and mix of formats.
 
-- **Messy files:** `dataset/messy/`, built by `scripts/make_messy.py`
-- **Raw table definitions:** `scripts/raw_tables.sql`
-- **Answer key** (every planted problem): `dataset/messy/answer_key.csv`. Keep it private and **never upload it to the Drive folder**.
+- **Messy files:** not included in this repo. Start from the [Olist dataset on Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce); the pipeline expects a deliberately messy copy (see section 8).
+- **Raw table definitions:** `setup/sql/cleaning_01_raw_tables.sql`
+- **Answer key** (every planted problem, if you generate one): keep it private and **never upload it to the Drive folder**.
 
 ---
 
@@ -46,7 +46,7 @@ flowchart LR
 
 ### 2.1 Supabase
 
-1. Open the Supabase **SQL editor** and run `scripts/raw_tables.sql`. This creates the `raw` schema and its 9 tables.
+1. Open the Supabase **SQL editor** and run `setup/sql/cleaning_01_raw_tables.sql`. This creates the `raw` schema and its 9 tables.
 2. Every column is `text` on purpose. Values like `R$ 81,16`, `-3`, `3x` and `11/01/2018 20:34` must load without errors, because fixing them is the cleaning workflow's job.
 3. Each table also has `_run_id` and `_loaded_at`. The two API tables also have `raw_record jsonb`, which stores the untouched JSON record.
 4. **Connecting from n8n:** use the **connection pooler** string (Project Settings → Database → Connection string → *Session pooler*), not the direct connection. The direct connection is IPv6-only, and n8n Cloud may not be able to reach it. Turn SSL on in the n8n Postgres credential.
@@ -256,10 +256,6 @@ select 'reviews_api', count(*) from raw.reviews_api;
 
 ---
 
-## 8. Regenerating the data
+## 8. Preparing the data
 
-```
-python -I scripts/make_messy.py dataset dataset/messy
-```
-
-Same seed, same output. Re-upload the files to Drive and the Sheet afterwards. Run `scripts/profile_olist.py` on any folder to profile it.
+The script that built the messy files and the profiling script are not part of this repo. To prepare data yourself, download the original Olist files from Kaggle and, for the full cleaning demo, introduce the kinds of problems the cleaning stage handles (mixed date formats, decimal commas, blank rows, repeated headers, duplicate and out-of-range values). The original files also work for a first run but show fewer cleaning issues. Upload the files to Drive and the Sheet afterwards.

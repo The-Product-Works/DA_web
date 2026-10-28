@@ -9,10 +9,10 @@ No Olist dataset is packaged or uploaded with this project. Metabase does not in
 ## What is included and what is not
 
 - `docker-compose.yml`: starts Metabase in Docker and persists its local application database in a named Docker volume.
-- `DASHBOARD.md`: dashboard/table design notes carried over from the supplied project materials.
+- `DASHBOARD.md`: dashboard and table design notes from the original project.
 - `dashboard.env.example`: a reference template for database connection values; it is **not** automatically loaded by Docker Compose and should not contain real secrets when committed.
 
-The supplied archives refer to `scripts/build_metabase_dashboard.py` and a Windows `metabase/start_metabase.cmd`, but neither file was present in the supplied ZIPs or this setup package. Therefore, this package does not claim to auto-build the dashboard. Use the manual UI steps below, or add and review that script separately before running it.
+The original project notes mention an automated dashboard build script (`build_metabase_dashboard.py`) and a Windows start script. Neither is part of this repo, so the dashboard is not built automatically. Use the manual UI steps below, or add and review such a script separately before running it.
 
 ## 1. Prerequisites
 
@@ -105,10 +105,10 @@ The original project notes describe a dashboard called `Olist sales`, a collecti
 5. Add state and category breakdowns using `analytics.revenue_by_state` and `analytics.top_categories`.
 6. Add Explain cards from `analytics.insight_summary`, `analytics.insight_causes`, and `analytics.insight_recommendations` only after the Explain workflow has populated them.
 7. Add an activity/log card from `ops.agent_logs` with an appropriate row limit and sort by the timestamp column actually present in that table.
-8. Save the dashboard as `Olist sales` if you want to match the supplied design notes. Add filters only after checking the real columns and field types. Test every filter and click behavior with known sample data.
+8. Save the dashboard as `Olist sales` if you want to match the design notes in `DASHBOARD.md`. Add filters only after checking the real columns and field types. Test every filter and click behavior with known sample data.
 9. Create the late-delivery drill-down dashboard only after verifying `analytics.order_facts` and the available filter columns. Treat click-through interactions as unverified until tested in your deployed Metabase version.
 
-Do not assume every card or click behavior is automatically generated. The referenced dashboard-building Python script is missing from the supplied project artifacts.
+Do not assume every card or click behavior is automatically generated. The dashboard-building script mentioned in the original notes is not in this repo.
 
 ## 7. End-to-end validation
 

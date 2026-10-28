@@ -1,33 +1,32 @@
 # Cleaning + Transformation: setup and run order
 
-This package holds the two Week 2 pipeline stages:
+This guide covers the two cleaning and transformation stages:
 
 - **Cleaning:** `raw.*` → `clean.*`. A Gemini agent proposes rules, and a person approves the risky ones in an n8n Form.
 - **Transformation:** `clean.*` → `analytics.*`. A Gemini agent writes SQL, each view is checked against a reference query, and the tables are published all at once.
 
-Follow the steps **in order**. Each step needs the one before it.
+Follow the steps **in order**. Each step needs the one before it. For the whole pipeline (collection and Explain too, local or cloud n8n), see [SETUP.md](../../SETUP.md).
 
 ---
 
-## What's in the package
+## Where things are
 
 ```
-README.md                       ← this file
-sql/
-  01_raw_tables.sql             raw landing tables (9 tables, all text)
-  02_ops_tables.sql             ops.agent_logs, ops.data_contracts
-  03_clean_tables.sql           clean.* tables, cleaning helper functions, rule/approval/quarantine tables
-  04_transform_tables.sql       models/analytics/transform schemas, roles, validate + publish functions
-workflows/
-  1_cleaning_approval.json      "Cleaning · Approve rules"   (n8n Form for the approver)
-  2_cleaning_main.json          "Cleaning · Main"
-  3_transformation_main.json    "Transformation · Main"
-docs/
-  CLEANING.md                   full explanation of the cleaning workflow
-  TRANSFORMATION.md             full explanation of the transformation workflow
+setup/sql/
+  cleaning_01_raw_tables.sql        raw landing tables (9 tables, all text)
+  cleaning_02_ops_tables.sql        ops.agent_logs, ops.data_contracts
+  cleaning_03_clean_tables.sql      clean.* tables, cleaning helper functions, rule/approval/quarantine tables
+  cleaning_04_transform_tables.sql  models/analytics/transform schemas, roles, validate + publish functions
+n8n/
+  1_cleaning_approval.json          "Cleaning · Approve rules"   (n8n Form for the approver)
+  2_cleaning_main.json              "Cleaning · Main"
+  3_transformation_main.json        "Transformation · Main"
+setup/docs/
+  CLEANING.md                       full explanation of the cleaning workflow
+  TRANSFORMATION.md                 full explanation of the transformation workflow
 ```
 
-The files were renamed with number prefixes to show the order. In `docs/`, `scripts/raw_tables.sql` means `sql/01_raw_tables.sql`, `n8n/ops_tables.sql` means `02`, `scripts/clean_tables.sql` means `03`, and `scripts/transform_tables.sql` means `04`.
+Other guides may refer to these SQL files by shorter names: `raw_tables.sql` is `cleaning_01_raw_tables.sql`, `ops_tables.sql` is `cleaning_02`, `clean_tables.sql` is `cleaning_03`, and `transform_tables.sql` is `cleaning_04`.
 
 ---
 
@@ -48,10 +47,10 @@ Run each file once, **in this order**. Each one is safe to run again.
 
 | # | File | Creates |
 |---|---|---|
-| 1 | `sql/01_raw_tables.sql` | `raw` schema + 9 raw tables (skip if collection already created them) |
-| 2 | `sql/02_ops_tables.sql` | `ops.agent_logs`, `ops.data_contracts` |
-| 3 | `sql/03_clean_tables.sql` | `clean.*` tables, `cleaning.*` helper functions, `ops.cleaning_rules`, `ops.cleaning_approvals`, `ops.quarantine` |
-| 4 | `sql/04_transform_tables.sql` | `models`, `analytics` and `transform` schemas; roles `transform_agent` and `analytics_reader`; `transform.validate_view()`, `transform.publish()`; `analytics.refresh_status`; `ops.transform_models` |
+| 1 | `setup/sql/cleaning_01_raw_tables.sql` | `raw` schema + 9 raw tables (skip if collection already created them) |
+| 2 | `setup/sql/cleaning_02_ops_tables.sql` | `ops.agent_logs`, `ops.data_contracts` |
+| 3 | `setup/sql/cleaning_03_clean_tables.sql` | `clean.*` tables, `cleaning.*` helper functions, `ops.cleaning_rules`, `ops.cleaning_approvals`, `ops.quarantine` |
+| 4 | `setup/sql/cleaning_04_transform_tables.sql` | `models`, `analytics` and `transform` schemas; roles `transform_agent` and `analytics_reader`; `transform.validate_view()`, `transform.publish()`; `analytics.refresh_status`; `ops.transform_models` |
 
 ---
 
@@ -74,11 +73,13 @@ Run each file once, **in this order**. Each one is safe to run again.
 
 ## Step 3: Import the workflows (in this order)
 
+These three come after the collection workflows. The full nine-workflow order is in [SETUP.md](../../SETUP.md#7-import-the-workflows).
+
 In n8n, go to **Overview → Create → Import from file**, or use the CLI with n8n stopped: `n8n import:workflow --input=<file>`.
 
-1. `workflows/1_cleaning_approval.json`
-2. `workflows/2_cleaning_main.json`
-3. `workflows/3_transformation_main.json`
+1. `n8n/1_cleaning_approval.json`
+2. `n8n/2_cleaning_main.json`
+3. `n8n/3_transformation_main.json`
 
 Then open each workflow and pick the credential on every node with a red warning triangle:
 
@@ -157,4 +158,4 @@ Connect with the user `metabase_reader.<project-ref>` through the Session pooler
 - **Re-runs are cheap.** Saved cleaning rules and saved transformation SQL are reused, so there's no AI call and no approval form. To get fresh proposals, set `FRESH_RULES = true` (in `Tables`) or `FRESH_SQL = true` (in `Questions`).
 - **Nightly run:** in Transformation · Main, enable the `Every night` trigger (02:00, off by default) and publish the workflow.
 
-For more detail, see `docs/CLEANING.md` and `docs/TRANSFORMATION.md`.
+For more detail, see [CLEANING.md](CLEANING.md) and [TRANSFORMATION.md](TRANSFORMATION.md).

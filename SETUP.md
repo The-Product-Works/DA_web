@@ -201,7 +201,7 @@ For each file: **Workflows → ⋯ → Import from File**, then save. Import in 
 | 8 | `3_transformation_main.json` | Transformation · Main |
 | 9 | `explain_main.json` | Explain · Main |
 
-No orchestrator workflow is included; you run the stages one after another.
+Only one rule is mandatory: the three collection loaders (2 to 4) must exist before `Collection · Main` (5), because it calls them by workflow ID. The rest of the order follows the data flow and is a convention. No orchestrator workflow is included; you run the stages one after another.
 
 ## 8. Configure the workflows
 
