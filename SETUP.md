@@ -30,6 +30,7 @@ This repo contains n8n workflows (`n8n/*.json`), SQL (`setup/sql/*.sql`) and Met
 | Docker (optional, recommended) | local n8n and Metabase | Docker Desktop, or Docker Engine + Compose plugin |
 | Node.js (only for the npm route) | local n8n via npm | use a version supported by your n8n release |
 | Supabase project | PostgreSQL 15+ database (minimum version 15) | any PostgreSQL 15 or newer works, but the guides target Supabase |
+| Olist dataset | source data | [Kaggle: Brazilian E-Commerce](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) |
 | Google account + Google Cloud project | Drive/Sheets sources | Drive API and Sheets API enabled (needed for self-hosted n8n OAuth) |
 | Anthropic API key | Collection workflow (`claude-sonnet-5-5`) | |
 | Google Gemini API key | Cleaning, Transformation, Explain (`models/gemini-2.5-flash`) | |
@@ -150,6 +151,8 @@ Because n8n runs on a server, the default `MOCK_API_URL` (`http://localhost:5678
 ## 5. Prepare the source data (Google Drive / Sheets)
 
 No dataset is included in this repo. The workflows read from Google Drive, Google Sheets and a mock API, not from a local folder. Supply the Olist data yourself.
+
+**Dataset:** [Olist Brazilian E-Commerce on Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) (public, about 100,000 real orders; a free Kaggle account is needed to download). The pipeline is designed for a deliberately messy copy of this data (mixed date formats, decimal commas, blank rows, repeated headers), which is what the cleaning stage is meant to handle. The original Kaggle files work for a first run but will show fewer cleaning issues.
 
 **Drive folder for CSVs.** Create a folder and upload `orders.csv`, `order_items.csv`, `customers.csv`, `sellers.csv`, `geolocation.csv`. Keep them as plain files (do not convert to Sheets). Note each file ID from its URL. **Never upload `answer_key.csv`.**
 

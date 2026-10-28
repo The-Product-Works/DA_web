@@ -18,6 +18,9 @@
 # PostgreSQL     >= 15 (minimum version; Supabase PostgreSQL is the documented target)
 # Metabase       self-hosted, via setup/metabase/docker-compose.yml (image metabase/metabase:latest; pin a tag for production)
 
+# --- Data -----------------------------------------------------------------
+# Olist Brazilian E-Commerce dataset (not bundled): https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce
+
 # --- Hosted services / accounts ---------------------------------------------
 # Supabase                project with PostgreSQL access and room for ~1M geolocation rows plus clean/analytics copies
 # Google account          Google Drive + Google Sheets (source CSVs, spreadsheet, mock-API JSON files)

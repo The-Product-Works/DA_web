@@ -25,6 +25,7 @@ An n8n-based pipeline that loads the Olist e-commerce dataset from Google Drive,
 
 | | |
 |---|---|
+| **Dataset** | [Olist Brazilian E-Commerce on Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce), about 100,000 real orders |
 | **Collect** | Nine sources land untouched in `raw.*` with AI-suggested data contracts |
 | **Clean** | AI proposes rules, a person approves the risky ones, typed `clean.*` tables result |
 | **Transform** | AI-written SQL is validated under a restricted role, then published to `analytics.*` |
@@ -120,7 +121,7 @@ Mock/real paginated API┘             │
 
 ## ⚠️ Limitations
 
-- No dataset is bundled; you provide the Olist files through Google Drive and Sheets.
+- No dataset is bundled. Download the [Olist Brazilian E-Commerce dataset from Kaggle](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) and provide the files through Google Drive and Sheets (see [SETUP.md](SETUP.md#5-prepare-the-source-data-google-drive--sheets)). The pipeline is built to handle a deliberately messy copy of this data, so the original files may need to be modified for the full cleaning demo.
 - No orchestrator workflow is included. Run the stages in order: Collection → Cleaning → Transformation → Explain.
 - The Metabase dashboard builder script mentioned in `dashboard.env.example` is not in the repo; build the dashboard manually.
 - Explain output from real Gemini runs and some Metabase click-throughs have not been validated by the authors.
