@@ -1,207 +1,35 @@
-# Olist Data Analytics Pipeline — requirements and environment setup
+# Olist Data Analytics Pipeline - dependencies
 #
-# This file is intentionally a detailed setup specification, not a pip requirements
-# lockfile. The supplied ZIPs contain n8n workflow JSON, SQL, and Markdown; they do
-# not contain Python source files or a Python dependency manifest.
+# This project has NO Python or npm source code: it is n8n workflow JSON (n8n/),
+# PostgreSQL SQL (setup/sql/) and Metabase config (setup/metabase/).
+# So there is nothing to `pip install -r` from this file. It is a manifest of the
+# external software and services the pipeline needs, with the minimum
+# versions required. Installation, configuration and cloud/local setup steps are
+# in SETUP.md.
+#
+# Lines starting with "#" are informational. Do not run pip against this file.
 
-## 1. Evidence scope and confidence
+# --- Runtime software -------------------------------------------------------
+# n8n            >= 2.42.7 (minimum version)
+#                  Local : Docker (recommended) OR Node.js + npm  ->  npm install -g n8n   (version 2.42.7 or newer)
+#                  Cloud : n8n Cloud, or self-hosted n8n on a server (see SETUP.md)
+# Node.js        only if you install n8n with npm; use a version supported by your chosen n8n release
+# Docker         optional but recommended: runs n8n and Metabase locally (Docker Desktop or Engine + Compose plugin)
+# PostgreSQL     >= 15 (minimum version; Supabase PostgreSQL is the documented target)
+# Metabase       self-hosted, via setup/metabase/docker-compose.yml (image metabase/metabase:latest; pin a tag for production)
 
-Reviewed all three supplied ZIP archives and every included workflow JSON, SQL file,
-Markdown guide, and environment example:
-- `collection_workflow.zip`
-- `Cleaning_Transformation_Package.zip`
-- `explain_phase.zip`
+# --- Hosted services / accounts ---------------------------------------------
+# Supabase                project with PostgreSQL access and room for ~1M geolocation rows plus clean/analytics copies
+# Google account          Google Drive + Google Sheets (source CSVs, spreadsheet, mock-API JSON files)
+# Google Cloud project    Drive API + Sheets API enabled (required for self-hosted n8n OAuth; not needed on n8n Cloud)
+# Anthropic API key       Collection workflow   (model: claude-sonnet-5-5)
+# Google Gemini API key   Cleaning, Transformation, Explain workflows   (model: models/gemini-2.5-flash)
 
-Values called out as “configured in export” are directly visible in workflow JSON.
-Where a ZIP's own guide describes a local environment or where a runtime/provider
-availability can change, verify it against your deployment before production use.
-Workflow exports do not contain credential objects/secrets; credentials must be
-created or reselected in your n8n instance.
+# --- n8n node families used by n8n/*.json (built into n8n, nothing to install) -
+# n8n-nodes-base: code, postgres, googleDrive, googleSheets, httpRequest, webhook, respondToWebhook,
+#                 extractFromFile, executeWorkflow, executeWorkflowTrigger, splitInBatches, splitOut, switch, if, wait, form, formTrigger,
+#                 manualTrigger, scheduleTrigger, stopAndError
+# @n8n/n8n-nodes-langchain: agent, lmChatAnthropic, lmChatGoogleGemini, outputParserStructured
 
-## 2. Runtime and core software
-
-| Component | Requirement / observed setting | Notes |
-|---|---|---|
-| n8n | n8n is required. Collection guide documents local n8n `2.42.7` at `http://localhost:5678`. | Use a compatible n8n release that supports the exported node types and node versions. The ZIP does not pin an n8n package/container digest. Confirm current node compatibility before upgrading. |
-| PostgreSQL | PostgreSQL-compatible database; the cleaning package explicitly says Supabase or any PostgreSQL 15+ works. | SQL uses schemas, JSONB, `information_schema`, window functions, `FILTER`, `percentile_cont`, `ctid`, unlogged tables, transactions, role/grant operations, and PL/pgSQL routines. Supabase is the documented target. |
-| Supabase | Required target database in the supplied setup guides. | Use a project with enough storage for raw, cleaning, and analytics data. Geolocation has about 1,002,183 rows and is the largest source. |
-| Node.js | Required only if self-hosting n8n through a Node.js installation rather than Docker/n8n Cloud. | No Node.js version is pinned by the supplied files. Follow the installation requirements for the exact n8n release you choose; do not infer a version from workflow JSON. |
-| Python | **No Python runtime or package requirement is established by the included files.** | The ZIPs contain no `.py` source or `requirements.txt` dependency list. n8n Code nodes use JavaScript and built-in n8n data APIs; their existence does not imply Python packages. |
-| JavaScript | n8n Code nodes execute JavaScript inside n8n. | No separately installed npm packages are evidenced by the supplied workflow JSON. Code nodes use built-in JavaScript and n8n expressions. |
-| Git / shell / Docker | Optional deployment conveniences, not a workflow dependency proven by exports. | Choose a deployment method appropriate to your environment. |
-| Metabase | Required for the documented dashboard stage. | The dashboard guide describes a local Metabase setup and a separate read-only PostgreSQL role. The supplied ZIP does not pin a Metabase version or package. |
-
-### Installation guidance
-
-- **n8n Cloud:** no local Node.js install is needed; create/import workflows in the hosted instance.
-- **Self-hosted n8n:** install a supported n8n release using the official n8n installation method. The collection guide's example is local n8n `2.42.7`, not a guaranteed minimum.
-- **Database:** create a Supabase project, then execute the SQL scripts in the order documented in `README.md`.
-- **Python:** do not run `pip install` for this project based on the supplied files. If future repository files introduce Python scripts, inspect those scripts and their own dependency declarations before adding packages.
-
-## 3. n8n workflow files and node families
-
-The supplied exports contain these workflows:
-
-| Exact workflow name | Exact source JSON path within ZIP | Main node families / purpose |
-|---|---|---|
-| `Collection · Main` | `collection_workflow/n8n/collection_main.json` | Manual trigger, Code, Switch, Execute Sub-workflow, Postgres, Anthropic AI Agent, Structured Output Parser, logging |
-| `Collection · Load CSV from Drive` | `collection_workflow/n8n/collect_load_csv.json` | Execute Workflow Trigger, Google Drive download, Extract From File (CSV), Code, Loop Over Items, Postgres |
-| `Collection · Load Sheet tab` | `collection_workflow/n8n/collect_load_sheet.json` | Execute Workflow Trigger, Google Sheets read, Code, Loop Over Items, Postgres |
-| `Collection · Load API source` | `collection_workflow/n8n/collect_load_api.json` | Execute Workflow Trigger, HTTP Request with pagination, Split Out, Code, Loop Over Items, Postgres |
-| `Mock API · Olist payments & reviews` | `collection_workflow/n8n/mock_api.json` | Webhook, Code, Google Drive download, Extract From File (JSON), Respond to Webhook |
-| `Cleaning · Approve rules` | `Cleaning_Transformation_Package/workflows/1_cleaning_approval.json` | Form Trigger, Form, Code, Postgres, HTTP Request to resume a waiting workflow |
-| `Cleaning · Main` | `Cleaning_Transformation_Package/workflows/2_cleaning_main.json` | Manual Trigger, Code, Postgres profiling/dry-run/apply, Gemini AI Agent, Structured Output Parser, IF, Loop Over Items, Wait, logs |
-| `Transformation · Main` | `Cleaning_Transformation_Package/workflows/3_transformation_main.json` | Manual/Schedule triggers, Code, Postgres, Gemini AI Agent, Structured Output Parser, IF, validation/repair/publish |
-| Explain workflow | `explain_phase/n8n/explain_main.json` | Manual Trigger, Code, Postgres, Gemini AI Agent, Structured Output Parser, reconciliation/repair, staged publishing/logging |
-
-Node types and versions are recorded in the JSON exports, but they are not separate OS packages. If n8n reports a missing node, update to a compatible n8n version or install the relevant n8n-supported node package only after confirming the exact missing node. The exports use core nodes and n8n AI/LangChain integration nodes.
-
-## 4. Database and SQL prerequisites
-
-Use the SQL files included in the supplied archives. Do not recreate these tables by guessing their definitions.
-
-### SQL scripts
-
-| Order | File path inside source ZIP | Purpose |
-|---|---|---|
-| 1 | `collection_workflow/scripts/raw_tables.sql` (same intended raw contract as `Cleaning_Transformation_Package/sql/01_raw_tables.sql`) | Creates `raw` schema and nine raw landing tables. All source data columns are text to preserve malformed values; API tables include `raw_record jsonb`. |
-| 2 | `collection_workflow/n8n/ops_tables.sql` (or `Cleaning_Transformation_Package/sql/02_ops_tables.sql`) | Creates `ops.agent_logs`, `ops.data_contracts`; the cleaning package version adds `ops.data_contracts.profile jsonb`. Prefer the cleaning package version for the end-to-end setup. |
-| 3 | `Cleaning_Transformation_Package/sql/03_clean_tables.sql` | Creates `clean` typed output tables, `cleaning` helper schema/functions, and ops tables for rules, approvals, and quarantine. |
-| 4 | `Cleaning_Transformation_Package/sql/04_transform_tables.sql` | Creates transformation/model schemas and tables, roles/grants, validation/publishing functions, `ops.transform_models`, `analytics.refresh_status`, and indexes. |
-| 5 | `explain_phase/scripts/insights_tables.sql` | Creates `insights` schema/config and analytics insight/fact/staging tables, indexes, and grants. Run after transformation schema is installed; verify the database owner can create required objects. |
-
-**Important:** `01_raw_tables.sql` and the collection `scripts/raw_tables.sql` are overlapping definitions. Run one of them, not both as competing sources of truth. For the complete pipeline, use `Cleaning_Transformation_Package/sql/01_raw_tables.sql`, which matches the downstream cleaning contract, and use `Cleaning_Transformation_Package/sql/02_ops_tables.sql` rather than the collection-only `ops_tables.sql`. Both packages are idempotent in many places, but that is not a substitute for a planned migration.
-
-### Database schemas and table contracts
-
-| Schema | Tables / objects | Contract |
-|---|---|---|
-| `raw` | `orders_csv`, `order_items_csv`, `customers_csv`, `sellers_csv`, `geolocation_csv`, `products_sheet`, `category_translation_sheet`, `payments_api`, `reviews_api` | Landing zone. Preserve source values as text, with load metadata (`_run_id`, `_loaded_at`) and untouched API JSON in `raw_record` where defined. |
-| `cleaning` | Helpers such as `try_numeric`, `try_timestamp`; dynamic working copies `cleaning.<source>` | Temporary/rebuildable work area for profiling, dry runs, and generated cleaning SQL. Do not treat as published analytics. |
-| `clean` | `orders`, `order_items`, `customers`, `sellers`, `geolocation`, `products`, `category_translation`, `payments`, `reviews` | Typed and cleaned data consumed by transformations. See `docs/CLEANING.md` and `sql/03_clean_tables.sql` for full column definitions. |
-| `ops` | `agent_logs`, `data_contracts`, `cleaning_rules`, `cleaning_approvals`, `quarantine`, `transform_models`; plus explain workflow's writes to logs | Run logs, data contracts/profiles, human decisions, quarantined records, validated SQL history and statuses. Keep the versions/columns in the SQL scripts aligned. |
-| `models` | One validated view per transformation question | AI-generated SQL is created/validated here under the restricted `transform_agent` role. |
-| `analytics` | `orders_wide`, `order_items_wide`, `kpi_summary`, `monthly_revenue`, `revenue_by_state`, `top_categories`, `refresh_status`, `order_facts`, `insight_summary`, `insight_causes`, `insight_recommendations` | Published tables consumed by Metabase and the Explain stage. Some objects are created by different SQL scripts and workflows. |
-| `insights` | `kpi_config`, `stage_summary`, `stage_causes`, `stage_recommendations` and SQL helper routines | Human-maintained KPI configuration and staging for Explain output before publication. |
-
-No extension creation is present in the supplied SQL scripts; no PostgreSQL extension is explicitly required by the inspected files. Do not enable an extension unless a deployment-specific check demonstrates a need.
-
-### Roles and permissions
-
-`04_transform_tables.sql` refers to database roles `transform_agent` and `analytics_reader`, and grants restricted permissions to them. It includes `grant transform_agent to current_user`, grants access to `clean`, and limits the AI role to creating views in `models` rather than directly publishing to `analytics`. It also grants the reader role select access to analytics objects and selected operational status/log objects.
-
-Before running this SQL:
-1. Review the script's role creation and grant statements in your Supabase environment.
-2. Confirm the executing database role has permission to create/alter roles and grant memberships. Supabase's managed-role constraints may require an owner/admin to adapt the SQL.
-3. Do not simply grant the AI agent or dashboard account database-owner/superuser privileges to bypass permission errors.
-4. If a role already exists, inspect its privileges rather than assuming it is configured safely.
-
-### Data volumes and preservation
-
-- Collection sources described in the included guide: five CSV files (orders, order items, customers, sellers, geolocation), two Google Sheet tabs (products, category translation), and two paginated JSON API sources (payments, reviews).
-- The source guide reports approximately 1,002,183 geolocation rows, 104,406 payments, and 99,544 reviews; counts may differ if datasets are regenerated.
-- Raw tables intentionally retain dirty values and repeated headers/blank rows so cleaning can detect them.
-- Do not upload `answer_key.csv` to Google Drive or any source folder read by the pipeline.
-
-## 5. n8n credentials actually needed
-
-Credential definitions are absent from the JSON exports, so create credentials in your n8n instance and explicitly select them on the relevant nodes after import. Credential names below are suggested labels, not exported secret identifiers.
-
-| Credential type | Used by | Fields / setup | Permissions / notes |
-|---|---|---|---|
-| **Postgres** (suggested label `Supabase`) | All Postgres nodes across collection, cleaning, transformation, and Explain workflows | Host, database (`postgres` for standard Supabase project), username, password, port (commonly `5432` for the documented session pooler), SSL required. Use the connection values shown by Supabase for your project and pooler. | Database role must be able to read/write target schemas and run the SQL functions used by the workflow. Do not use a broad owner credential for the dashboard. |
-| **Google Drive OAuth2 / Google Drive account** | `Collection · Load CSV from Drive`, `Mock API · Olist payments & reviews` | n8n Google Drive credential authorization. For self-hosted OAuth, configure Google Cloud OAuth client ID/secret and the exact redirect URI displayed by n8n. | Grant access only to the source folders/files needed by the workflow. |
-| **Google Sheets OAuth2 / Google Sheets account** | `Collection · Load Sheet tab` | n8n Google Sheets credential authorization; spreadsheet must be accessible to the connected Google account. | Read access is sufficient for source tabs. Enable Google Sheets API and Drive API in Google Cloud for self-hosted OAuth. |
-| **Anthropic API** | `Collection · Main`: `Contract model` and `Mismatch model` (Anthropic chat model nodes) | Anthropic API credential / API key in n8n; selected model identifier in export is `claude-sonnet-5-5`. | Confirm the model ID is currently available to your account and supported by your n8n node version; model catalog changes are not verified by the ZIP. |
-| **Google Gemini API** | `Cleaning · Main`, `Transformation · Main`, Explain workflow; model nodes and repair nodes | Google Gemini API credential / API key in n8n. Exported model setting is `models/gemini-2.5-flash`. | Confirm the model remains available to your project/provider and set spending/quota controls. |
-| HTTP Request auth | `Collection · Load API source` calls the mock API URL; `Cleaning · Approve rules` POSTs the n8n wait-resume URL | The exported mock API request has no authentication configured. The approval resume request uses a URL produced by the workflow's form/wait interaction. | For the local mock API, same-instance network reachability is required. For real APIs or production endpoints, configure authentication only if the endpoint requires it; no additional external API credentials are evidenced in this export. |
-| Metabase database connection | Metabase, not an n8n credential | Use a separate read-only PostgreSQL role such as `analytics_reader`; use Supabase connection details. The dashboard guide notes the pooler username may need the `metabase_reader.<project-ref>` form if that named user is used. | Read only published analytics tables. Do not reuse the n8n write credential. |
-
-The export's `credentials` fields are missing/empty on the inspected nodes. This means no actual credential names or secret values can be recovered from the ZIP. Assign each credential type explicitly in n8n; do not assume the exports will connect automatically.
-
-## 6. LLM requirements and exact model settings
-
-| Workflow stage | Provider | Model configured in JSON | Purpose |
-|---|---|---|---|
-| Collection data-contract agent and mismatch agent | Anthropic | `claude-sonnet-5-5` | Suggest source contracts and summarize cross-source mismatches |
-| Cleaning rule agent | Google Gemini | `models/gemini-2.5-flash` | Propose cleaning rules from profiles, contracts, and checks |
-| Transformation SQL agent and repair agent | Google Gemini | `models/gemini-2.5-flash` | Generate/repair SQL views against the clean schema |
-| Explain insight agent and repair agent | Google Gemini | `models/gemini-2.5-flash` | Explain KPI movement and propose causes/recommendations using aggregated breakdowns |
-
-The models' names and output-token/temperature settings are visible in JSON; their current availability, pricing, provider account requirements, and future compatibility cannot be guaranteed by these files. Set up API billing/quota and a usage limit before running all stages. The agents are expected to return structured outputs through n8n Structured Output Parser nodes.
-
-## 7. Source integrations and configuration parameters
-
-### Google Drive / Google Sheets
-
-- Upload the five CSV sources to a dedicated Drive folder and record each file ID.
-- Create one spreadsheet with tabs exactly `products` and `category_translation`; record its spreadsheet ID.
-- Preserve values as text during import. The guide specifically warns against converting strings such as decimal-comma values or leading-zero ZIP prefixes into numbers/dates.
-- In `Collection · Main` → `Sources` Code node, replace each `DRIVE_FILE_IDS` `PASTE_ID`, and `SPREADSHEET_ID` `PASTE_ID`.
-- Reconnect Google Drive and Google Sheets credentials on their nodes.
-
-### Mock API and webhooks
-
-- Workflow: `Mock API · Olist payments & reviews`, path `olist-mock-api`, GET webhook, response node.
-- Collection `Sources` node defaults `MOCK_API_URL` to `http://localhost:5678/webhook/olist-mock-api`.
-- This URL only works if the mock API workflow is published and reachable from the HTTP Request node's runtime. `localhost` means the n8n host/container itself; it does not mean the user's browser or another container.
-- If n8n is containerized or remote, replace it with a reachable host/service URL. Do not put a `/webhook-test/` URL in the collection source settings for normal runs.
-- API pagination is configured using query parameter `page`, with a maximum of 50 requests; the response contract includes `page`, `total_pages`, and `data`. Verify the mock API response matches the loader's expected data shape before full load.
-
-### Collection `Sources` Code node
-
-Observed configurable values:
-- `DRIVE_FILE_IDS`: `orders`, `order_items`, `customers`, `sellers`, `geolocation`
-- `SPREADSHEET_ID`
-- `MOCK_API_URL`
-- `ONLY`: empty means all nine sources; use a short list for safe tests
-- `batch_size`: default 2,000 rows; geolocation explicitly uses 5,000
-- source mapping includes `category_translation_sheet`, `sellers_csv`, `products_sheet`, `customers_csv`, `orders_csv`, `order_items_csv`, `payments_api`, `reviews_api`, and `geolocation_csv`.
-
-### Cleaning workflow settings
-
-In `Cleaning · Main` → `Tables` Code node:
-- `ONLY`: empty means all cleaning sources; can be set to one source such as `['sellers']` for a test.
-- `FRESH_RULES`: false by default; true forces new rule proposals rather than reuse of saved rules.
-- `APPROVAL_FORM_URL`: must be checked and configured for your n8n instance if the approval link/form URL is environment-specific.
-- The workflow waits up to 2 hours for approval. Undecided rules are expired/rejected by the workflow logic; understand the consequences before production use.
-
-### Transformation workflow settings
-
-In `Transformation · Main` → `Questions` Code node:
-- `ONLY`: empty means all configured views; can be set to a small list such as `['kpi_summary']`.
-- `FRESH_SQL`: false by default; true asks the model for fresh SQL instead of reusing a previously passed definition.
-- A nightly Schedule Trigger is configured for cron `0 2 * * *` (02:00 in the n8n runtime's timezone). It is not automatically active merely because it exists in the JSON; enable/publish only after manual tests.
-
-### Explain workflow settings
-
-In Explain workflow → `Settings` Code node:
-- `MONTHS`: empty means all months with a movement; can be set e.g. `['2018-03']` for a targeted run.
-- `KPIS`: empty means all enabled KPIs in `insights.kpi_config`.
-- Explain uses a staging-and-publish pattern: stage results are reconciled/validated before final publication. Do not bypass its checks.
-
-### Metabase environment example
-
-`explain_phase/metabase/dashboard.env.example` is included in the Explain ZIP. It names `MB_URL`, `MB_ADMIN_EMAIL`, `MB_ADMIN_PASSWORD`, optional `MB_DATABASE`, and PostgreSQL connection values `PG_HOST`, `PG_PORT`, `PG_DB`, `PG_USER`, `PG_PASSWORD`. Use placeholders and a private `.env` file; do not commit secrets. The referenced `scripts/build_metabase_dashboard.py` is not included in the supplied archives, so the template alone cannot run that builder; create the dashboard manually using `metabase/DASHBOARD.md` or obtain the missing script separately.
-
-## 8. External services and permissions checklist
-
-- Supabase project and database capacity for all raw, clean, working, model, and analytics objects.
-- Google Cloud project with Drive API and Sheets API enabled if using self-hosted Google OAuth.
-- Google account that can read the five CSV files and spreadsheet tabs.
-- Anthropic API account/key for collection's two model nodes.
-- Google AI / Gemini API account/key for cleaning, transformation, and Explain.
-- n8n reachable by Google OAuth redirect URI and able to reach Supabase and source endpoints.
-- Mock API workflow published and accessible to the HTTP Request node.
-- Metabase instance able to connect to Supabase PostgreSQL using a read-only role.
-- If running n8n in Docker or remotely, use service DNS/host addresses rather than assuming `localhost` points to the intended service.
-
-## 9. Not verified / do not assume
-
-- No Python packages, `pip` command, `package.json`, `pyproject.toml`, npm dependency list, or lockfile is present in the supplied ZIPs.
-- No exact minimum PostgreSQL version or Supabase plan is specified.
-- No database extension is created by the SQL scripts.
-- No actual credential objects, API keys, passwords, OAuth client secrets, or live service URLs are included in workflow exports.
-- No workflow JSON for a separate Week 3 orchestrator is included in these three ZIPs. Collection docs mention a future orchestrator, but do not treat it as supplied or importable.
-- Current availability of `claude-sonnet-5-5`, `models/gemini-2.5-flash`, provider pricing, quota, and n8n Cloud/hosted service policies must be confirmed at setup time.
-- The included Explain documentation says real Gemini responses and Metabase click-through behavior have not yet been validated; do not represent these as verified live integration tests.
+# --- Python / npm packages --------------------------------------------------
+# None required.
