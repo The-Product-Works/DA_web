@@ -1,10 +1,44 @@
+<div align="center">
+
+<img src="assets/logo.jpg" alt="Iburgeon: Build · Scale · Beyond" width="420">
+
 # Olist Data Analytics Pipeline
 
-An n8n-based data pipeline that loads the Olist e-commerce dataset from Google Drive, Google Sheets and a paginated API into Supabase (PostgreSQL), cleans it with AI-proposed and human-approved rules, builds validated analytics tables, generates KPI explanations, and shows the results in Metabase.
+**From raw e-commerce data to AI-explained KPIs, on n8n, Supabase and Metabase.**
 
-## Quick start
+![n8n](https://img.shields.io/badge/n8n-%E2%89%A5%202.42.7-EA4B71?logo=n8n&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-%E2%89%A5%2015-4169E1?logo=postgresql&logoColor=white)
+![Supabase](https://img.shields.io/badge/Supabase-database-3ECF8E?logo=supabase&logoColor=white)
+![Metabase](https://img.shields.io/badge/Metabase-dashboard-509EE3?logo=metabase&logoColor=white)
+![Anthropic](https://img.shields.io/badge/Anthropic-Claude-191919?logo=anthropic&logoColor=white)
+![Gemini](https://img.shields.io/badge/Google-Gemini-8E75B2?logo=googlegemini&logoColor=white)
 
-1. Clone the repo and install the tools you need (n8n, Docker, accounts): see [requirements.txt](requirements.txt).
+[Quick start](#-quick-start) · [How it works](#-how-it-works) · [Setup guide](SETUP.md) · [Requirements](requirements.txt) · [Docs](#-documentation)
+
+</div>
+
+---
+
+## Overview
+
+An n8n-based pipeline that loads the Olist e-commerce dataset from Google Drive, Google Sheets and a paginated API into Supabase (PostgreSQL). It cleans the data with AI-proposed, human-approved rules, builds validated analytics tables, generates KPI explanations, and shows the results in Metabase.
+
+| | |
+|---|---|
+| **Collect** | Nine sources land untouched in `raw.*` with AI-suggested data contracts |
+| **Clean** | AI proposes rules, a person approves the risky ones, typed `clean.*` tables result |
+| **Transform** | AI-written SQL is validated under a restricted role, then published to `analytics.*` |
+| **Explain** | KPI movements are explained from aggregated data and reconciled before publishing |
+| **Visualize** | Metabase dashboards read the published tables |
+
+## 🚀 Quick start
+
+```sh
+git clone https://github.com/The-Product-Works/DA_web.git
+cd DA_web
+```
+
+1. Check the tools and accounts you need in [`requirements.txt`](requirements.txt). There are no Python or npm packages to install for the project itself.
 2. Follow **[SETUP.md](SETUP.md)** end to end. It covers:
    - running n8n **locally** (Docker or npm), on **n8n Cloud**, or **self-hosted on a server**
    - Supabase and the SQL scripts, in order
@@ -12,14 +46,7 @@ An n8n-based data pipeline that loads the Olist e-commerce dataset from Google D
    - importing and configuring the nine workflows
    - running and testing each stage, setting up Metabase, and troubleshooting
 
-```sh
-git clone https://github.com/The-Product-Works/DA_web.git
-cd DA_web
-```
-
-There are no Python or npm packages to install for the project itself. `requirements.txt` lists the external software and services.
-
-## How it works
+## 🧭 How it works
 
 ```text
 Google Drive CSVs ─────┐
@@ -52,39 +79,46 @@ Mock/real paginated API┘             │
 
 | Stage | Workflows (`n8n/`) | Output | LLM |
 |---|---|---|---|
-| Collection | `mock_api`, `collect_load_csv`, `collect_load_sheet`, `collect_load_api`, `collection_main` | `raw.*`, data contracts, mismatch report | Anthropic `claude-sonnet-5-5` |
-| Cleaning | `1_cleaning_approval`, `2_cleaning_main` | typed `clean.*`, rules, quarantine | Gemini `models/gemini-2.5-flash` |
-| Transformation | `3_transformation_main` | validated `models.*` views, published `analytics.*` | Gemini `models/gemini-2.5-flash` |
-| Explain | `explain_main` | `analytics.insight_*` | Gemini `models/gemini-2.5-flash` |
-| Dashboard | (Metabase, `setup/metabase/`) | KPI tiles, trends, insights | none |
+| **Collection** | `mock_api`, `collect_load_csv`, `collect_load_sheet`, `collect_load_api`, `collection_main` | `raw.*`, data contracts, mismatch report | Anthropic `claude-sonnet-5-5` |
+| **Cleaning** | `1_cleaning_approval`, `2_cleaning_main` | typed `clean.*`, rules, quarantine | Gemini `models/gemini-2.5-flash` |
+| **Transformation** | `3_transformation_main` | validated `models.*` views, published `analytics.*` | Gemini `models/gemini-2.5-flash` |
+| **Explain** | `explain_main` | `analytics.insight_*` | Gemini `models/gemini-2.5-flash` |
+| **Dashboard** | Metabase (`setup/metabase/`) | KPI tiles, trends, insights | none |
 
-Key design points:
+### Design principles
 
-- Raw data is kept as received (all text). Cleaning happens in a separate stage.
-- Risky cleaning rules wait for a human decision in an n8n form.
-- AI-generated SQL runs under a restricted role, is validated, and is published only after every check passes.
-- Only aggregated data is sent to the model in the Explain stage.
-- Saved rules and SQL are reused, so repeat runs do not call the models again unless you set `FRESH_RULES` or `FRESH_SQL`.
+- **Raw stays raw.** Source data is kept as received (all text); cleaning is a separate stage.
+- **Humans approve risk.** Risky cleaning rules wait for a decision in an n8n form.
+- **Guarded AI.** Generated SQL runs under a restricted role, is validated, and is published only after every check passes.
+- **Minimal exposure.** Only aggregated data is sent to the model in the Explain stage.
+- **Cheap reruns.** Saved rules and SQL are reused, so repeat runs skip the models unless you set `FRESH_RULES` or `FRESH_SQL`.
 
-## Repository layout
+## 🗂 Repository layout
 
 ```text
-n8n/                  n8n workflow exports (import into n8n)
-setup/sql/            database scripts (run in the order given in SETUP.md)
-setup/metabase/       Metabase docker-compose, dashboard guide, env example
-setup/docs/           per-stage guides: collection, cleaning, transformation, explain, dashboard
-SETUP.md              installation and setup guide (local and cloud)
-requirements.txt      dependency manifest (software and services; nothing to pip install)
+.
+├── n8n/                 n8n workflow exports (import into n8n)
+├── setup/
+│   ├── sql/             database scripts (run in the order given in SETUP.md)
+│   ├── metabase/        docker-compose, dashboard guide, env example
+│   └── docs/            per-stage guides
+├── assets/              images used in this README
+├── SETUP.md             installation and setup guide (local and cloud)
+└── requirements.txt     dependency manifest (nothing to pip install)
 ```
 
-## Documentation
+## 📚 Documentation
 
-- [SETUP.md](SETUP.md): full installation and configuration
-- [setup/docs/collection_sources_guide.md](setup/docs/collection_sources_guide.md): source files and column contracts
-- [setup/docs/CLEANING.md](setup/docs/CLEANING.md), [TRANSFORMATION.md](setup/docs/TRANSFORMATION.md), [EXPLAIN.md](setup/docs/EXPLAIN.md): stage details
-- [setup/metabase/README.md](setup/metabase/README.md), [DASHBOARD.md](setup/metabase/DASHBOARD.md): dashboard setup
+| Guide | Contents |
+|---|---|
+| [SETUP.md](SETUP.md) | Full installation and configuration, local and cloud |
+| [Collection sources](setup/docs/collection_sources_guide.md) | Source files and column contracts |
+| [Cleaning](setup/docs/CLEANING.md) | Profiling, rules, approval, clean tables |
+| [Transformation](setup/docs/TRANSFORMATION.md) | Business definitions, SQL validation, publishing |
+| [Explain](setup/docs/EXPLAIN.md) | KPI config, reconciliation, insights |
+| [Metabase](setup/metabase/README.md) · [Dashboard](setup/metabase/DASHBOARD.md) | Dashboard setup |
 
-## Limitations
+## ⚠️ Limitations
 
 - No dataset is bundled; you provide the Olist files through Google Drive and Sheets.
 - No orchestrator workflow is included. Run the stages in order: Collection → Cleaning → Transformation → Explain.
