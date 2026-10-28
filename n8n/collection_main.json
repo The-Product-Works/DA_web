@@ -1,0 +1,1032 @@
+{
+  "id": "olistCollMain001",
+  "name": "Collection · Main",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "0ab74079-8f12-5086-a350-588e3cfc107a",
+      "name": "Run collection",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Start here: click 'Execute workflow' to run the whole collection stage once. In Week 3 the orchestrator will call this stage instead.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// ==== Fill in once ==========================================================\nconst DRIVE_FILE_IDS = {          // Google Drive file IDs of the 5 CSVs\n  orders: 'PASTE_ID',\n  order_items: 'PASTE_ID',\n  customers: 'PASTE_ID',\n  sellers: 'PASTE_ID',\n  geolocation: 'PASTE_ID',\n};\nconst SPREADSHEET_ID = 'PASTE_ID';  // the \"Olist product list\" Google Sheet\nconst MOCK_API_URL = 'http://localhost:5678/webhook/olist-mock-api';  // Production URL of the mock API\nconst ONLY = [];  // to test a few sources, e.g. ['sellers', 'products']; empty = all 9\n// ============================================================================\n\nconst runId = 'collect_' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);\n\n// Smallest first, geolocation last: problems show up early and cheaply\nconst sources = [\n  { source: 'category_translation', type: 'sheet', table: 'category_translation_sheet', tab: 'category_translation' },\n  { source: 'sellers', type: 'csv', table: 'sellers_csv', file: 'sellers.csv' },\n  { source: 'products', type: 'sheet', table: 'products_sheet', tab: 'products' },\n  { source: 'customers', type: 'csv', table: 'customers_csv', file: 'customers.csv' },\n  { source: 'orders', type: 'csv', table: 'orders_csv', file: 'orders.csv' },\n  { source: 'order_items', type: 'csv', table: 'order_items_csv', file: 'order_items.csv' },\n  { source: 'payments', type: 'api', table: 'payments_api', api_source: 'payments',\n    columns: ['order_id', 'payment_sequential', 'payment_type', 'payment_installments', 'payment_value'] },\n  { source: 'reviews', type: 'api', table: 'reviews_api', api_source: 'reviews',\n    columns: ['review_id', 'order_id', 'review_score', 'review_comment_title', 'review_comment_message',\n              'review_creation_date', 'review_answer_timestamp'] },\n  { source: 'geolocation', type: 'csv', table: 'geolocation_csv', file: 'geolocation.csv', batch_size: 5000 },\n];\n\nreturn sources\n  .filter(s => ONLY.length === 0 || ONLY.includes(s.source))\n  .map(s => ({ json: {\n    ...s,\n    run_id: runId,\n    batch_size: s.batch_size ?? 2000,\n    file_id: DRIVE_FILE_IDS[s.source] ?? null,\n    spreadsheet_id: SPREADSHEET_ID,\n    api_url: MOCK_API_URL,\n    label: s.file ?? (s.tab ? `Sheet tab ${s.tab}` : `${s.api_source} API`),\n  } }));"
+      },
+      "id": "5a123ba8-8d7c-5814-844f-f2140ad83b69",
+      "name": "Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Settings for the run. Fill in once: the 5 Drive file IDs, the spreadsheet ID and the mock API URL. Lists all 9 sources in load order (smallest first, geolocation last) with their type, raw table and batch size, and creates the run ID. To test a few sources only, put them in ONLY, e.g. ['sellers'].",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "939bd6d9-49b4-5096-bee7-120e2afe908c",
+      "name": "Each source",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Loop Over Items, one source at a time, so only one source's data is in memory at once. 'loop' output = next source; 'done' output = all sources attempted.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.type }}",
+                    "rightValue": "csv",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "csv"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.type }}",
+                    "rightValue": "sheet",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sheet"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.type }}",
+                    "rightValue": "api",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "api"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "eb2e2ffd-ca8e-5e46-a5c7-ee9bcb87a2a0",
+      "name": "By source type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        660,
+        420
+      ],
+      "notes": "Switch: sends each source to the loader for its type: csv, sheet or api.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "olistLoadCsv0001"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "b958d16b-d88b-5ce8-a599-f2acb1307845",
+      "name": "Load CSV from Drive",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        280
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Calls the sub-workflow 'Collection · Load CSV from Drive' for this source and waits for it to finish. Set to continue on error, so one failing source does not stop the others.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "olistLoadSht0001"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "a1925027-0e9d-56ca-bd5f-d2bdb2ccf284",
+      "name": "Load Sheet tab",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        440
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Calls the sub-workflow 'Collection · Load Sheet tab' for this source and waits for it to finish. Set to continue on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "olistLoadApi0001"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "aaaba974-0797-53fb-a081-81b4b06ae246",
+      "name": "Load API source",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        600
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Calls the sub-workflow 'Collection · Load API source' for this source and waits for it to finish. Set to continue on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// The loader returns one summary item, or an error if it failed (the node continues on error)\nconst src = $('Each source').first().json;\nconst result = $input.first().json;\nif (result.error || result.status === undefined) {\n  const message = result.error?.message ?? result.error ?? 'Loader returned no result';\n  return [{ json: { ...src, failed: true, status: 'failed', error: String(message) } }];\n}\nreturn [{ json: { ...src, ...result, failed: false } }];"
+      },
+      "id": "62ace6ce-81e6-5944-8218-280816501ef5",
+      "name": "Check result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        440
+      ],
+      "notes": "Combines the source's settings with what the loader returned and marks it failed: true if the loader returned an error or nothing.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.failed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6255130d-856b-5d30-8f88-46cf01e88b08",
+      "name": "Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        440
+      ],
+      "notes": "true → log the failure, then continue with the next source. false → continue with the next source.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nreturn [{ json: {\n  run_id: r.run_id, agent: 'collection', action: 'load', source: r.source,\n  target_table: `raw.${r.table}`, status: 'failed', rows_read: null, rows_written: null,\n  duration_ms: null, reason: `Loading ${r.label} failed: ${r.error}`,\n  details: JSON.stringify({ type: r.type, error: r.error }),\n} }];"
+      },
+      "id": "09712c29-6160-5e85-8752-c6f5f44014bc",
+      "name": "Failure log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        380
+      ],
+      "notes": "Builds an ops.agent_logs row with status 'failed' and the error message.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "236f844f-d3c1-5db5-a188-2ad69a3482e8",
+      "name": "Log failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        380
+      ],
+      "notes": "Writes the failure row into ops.agent_logs, then goes back to 'Each source'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep only the sources that loaded (failure log rows have no 'failed' field)\nreturn $input.all().filter(item => item.json.failed === false);"
+      },
+      "id": "e068a203-54ab-5d93-9551-d9e2dda0058d",
+      "name": "Loaded sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        120
+      ],
+      "notes": "Keeps only the sources that loaded successfully. Failed sources get no data contract.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "f4fef3c2-d726-5645-8ad7-e4c0af204fad",
+      "name": "Each loaded source",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        880,
+        120
+      ],
+      "notes": "Loop Over Items over the loaded sources, one at a time, to write a data contract for each. 'done' output continues to the cross-source checks.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Profile every column of the raw table, whatever its columns are\nselect key as column_name,\n       count(*) as total_rows,\n       count(*) filter (where value is null or btrim(value) = '') as blank_values,\n       count(distinct value) as distinct_values,\n       (array_agg(distinct left(value, 60)) filter (where value is not null and btrim(value) <> ''))[1:8] as example_values\nfrom raw.{{ $json.table }} t,\n     jsonb_each_text(to_jsonb(t) - '_run_id' - '_loaded_at' - 'raw_record')\ngroup by key\norder by key;",
+        "options": {}
+      },
+      "id": "ecc0f45c-a43b-586e-adf3-070cbb4ec5b0",
+      "name": "Profile columns",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        760
+      ],
+      "notes": "SQL profile of the raw table: per column, the number of rows, blank values and distinct values, plus up to 8 example values. Works for any raw table without knowing its columns.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- 20 random rows (not the first 20, which are rarely representative)\nselect * from raw.{{ $('Each loaded source').first().json.table }}\norder by random()\nlimit 20;",
+        "options": {}
+      },
+      "id": "d32b1ad2-f29d-5a68-b389-fe64765c0e52",
+      "name": "Sample rows",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        760
+      ],
+      "executeOnce": true,
+      "notes": "Takes 20 random rows from the raw table (random, because the first rows are rarely typical). Runs once per source.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the prompt from the profile and sample only. Whole tables are never sent to the LLM.\nconst src = $('Each loaded source').first().json;\nconst profile = $('Profile columns').all().map(i => i.json);\nconst sample = $('Sample rows').all().map(i => {\n  const row = { ...i.json };\n  delete row._run_id; delete row._loaded_at;\n  for (const k of Object.keys(row)) {\n    if (typeof row[k] === 'string' && row[k].length > 200) row[k] = row[k].slice(0, 200) + '…';\n  }\n  return row;\n});\nconst prompt = [\n  `Source: ${src.source}`,\n  `Arrived as: ${src.type} (${src.label})`,\n  `Raw table: raw.${src.table}`,\n  `Rows loaded: ${src.rows_written}`,\n  '',\n  'Column profile (JSON):',\n  JSON.stringify(profile),\n  '',\n  'Random sample of 20 rows (JSON):',\n  JSON.stringify(sample),\n].join('\\n');\nreturn [{ json: { prompt, source: src.source, table: src.table, run_id: src.run_id } }];"
+      },
+      "id": "98506f64-5277-544e-bb41-8bf1d9c23443",
+      "name": "Build contract prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        760
+      ],
+      "notes": "Puts the profile and the sample into one prompt for the Contract agent. Long text is cut to 200 characters. The whole table is never sent to the LLM.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are the collection agent in a data pipeline. You write a data contract for one raw data source.\nThe raw table stores every value as text exactly as it arrived; nothing has been cleaned.\nUse only the column profile and the sample rows you are given. Do not invent columns or numbers.\nFor each column, state what it should contain once clean (expected_type: text, integer, decimal, timestamp, date, boolean, json) and whether it may be empty.\nList the problems you can actually see (mixed date formats, numbers stored with units or commas, inconsistent spellings, negative values, blanks, repeated header rows, renamed keys in raw_record, likely duplicates).\nKeep descriptions short and plain."
+        }
+      },
+      "id": "af16fb90-5bae-5a7a-9968-36b3b232b389",
+      "name": "Contract agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1780,
+        760
+      ],
+      "notes": "AI agent (FR-C2) that writes the source's data contract: grain, likely key, the expected type of each column once clean, and the problems it can see. Returns structured JSON in the format of 'Contract output format'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-sonnet-5-5"
+        },
+        "options": {
+          "maxTokensToSample": 4096,
+          "temperature": 0
+        }
+      },
+      "id": "e1e3347c-4e2f-58e7-a781-81340b111f8b",
+      "name": "Contract model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        1740,
+        980
+      ],
+      "notes": "The LLM the Contract agent uses (Claude Sonnet 5.5, temperature 0 for consistent answers). Needs the Anthropic credential. Replace this node to use OpenAI instead.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n  \"source\": \"orders\",\n  \"grain\": \"one row per order\",\n  \"likely_primary_key\": [\n    \"order_id\"\n  ],\n  \"row_count\": 100113,\n  \"columns\": [\n    {\n      \"name\": \"order_purchase_timestamp\",\n      \"expected_type\": \"timestamp\",\n      \"nullable\": false,\n      \"description\": \"When the customer placed the order\",\n      \"observed_issues\": [\n        \"mixed date formats: YYYY-MM-DD hh:mm:ss and DD/MM/YYYY hh:mm\"\n      ]\n    }\n  ],\n  \"quality_flags\": [\n    {\n      \"severity\": \"high\",\n      \"column\": \"order_purchase_timestamp\",\n      \"issue\": \"about 14% of dates are not in ISO format\"\n    }\n  ],\n  \"summary\": \"Two or three sentences describing the source and its main problems.\"\n}"
+      },
+      "id": "c81a9b43-96e8-52b7-b8ef-932a6098981c",
+      "name": "Contract output format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        1920,
+        980
+      ],
+      "notes": "Structured Output Parser: forces the Contract agent's answer into fixed JSON (source, grain, likely_primary_key, row_count, columns, quality_flags, summary), so it can be stored and read reliably.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = $('Build contract prompt').first().json;\nreturn [{ json: {\n  run_id: meta.run_id,\n  source: meta.source,\n  raw_table: `raw.${meta.table}`,\n  contract: JSON.stringify($input.first().json.output),\n} }];"
+      },
+      "id": "a77d903e-c584-5c37-b9d5-7965a2889e2a",
+      "name": "Contract row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        760
+      ],
+      "notes": "Builds the ops.data_contracts row: run ID, source, raw table and the contract JSON.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "data_contracts"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "5c056779-cf06-5c80-9f54-c9a758d2ca86",
+      "name": "Save data contract",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2320,
+        760
+      ],
+      "notes": "Writes the contract into ops.data_contracts, then goes back to 'Each loaded source'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Cross-source checks on the raw data (FR-C3). Values are compared after trimming only.\nwith\norders      as (select distinct btrim(order_id) id, btrim(customer_id) customer_id from raw.orders_csv where btrim(coalesce(order_id, '')) not in ('', 'order_id')),\nitems       as (select distinct btrim(order_id) order_id, btrim(product_id) product_id, btrim(seller_id) seller_id from raw.order_items_csv where btrim(coalesce(order_id, '')) not in ('', 'order_id')),\ncustomers   as (select distinct btrim(customer_id) id, lpad(btrim(customer_zip_code_prefix), 5, '0') zip from raw.customers_csv where btrim(coalesce(customer_id, '')) <> ''),\nsellers     as (select distinct btrim(seller_id) id from raw.sellers_csv where btrim(coalesce(seller_id, '')) <> ''),\nproducts    as (select distinct btrim(product_id) id, lower(btrim(product_category_name)) category from raw.products_sheet where btrim(coalesce(product_id, '')) <> ''),\ncategories  as (select distinct lower(btrim(product_category_name)) category from raw.category_translation_sheet),\ngeo         as (select distinct lpad(btrim(geolocation_zip_code_prefix), 5, '0') zip from raw.geolocation_csv)\nselect 'order_items → orders' as between_sources, 'order_id in order_items with no matching order' as check_name,\n       count(*) as mismatches from (select distinct order_id from items) x where not exists (select 1 from orders o where o.id = x.order_id)\nunion all\nselect 'order_items → products', 'product_id in order_items with no matching product',\n       count(*) from (select distinct product_id from items where product_id <> '') x where not exists (select 1 from products p where p.id = x.product_id)\nunion all\nselect 'order_items → sellers', 'seller_id in order_items with no matching seller',\n       count(*) from (select distinct seller_id from items) x where not exists (select 1 from sellers s where s.id = x.seller_id)\nunion all\nselect 'orders → customers', 'customer_id in orders with no matching customer',\n       count(*) from (select distinct customer_id from orders) x where not exists (select 1 from customers c where c.id = x.customer_id)\nunion all\nselect 'payments API → orders', 'order_id in payments with no matching order',\n       count(*) from (select distinct btrim(order_id) id from raw.payments_api where order_id is not null) x where not exists (select 1 from orders o where o.id = x.id)\nunion all\nselect 'reviews API → orders', 'order_id in reviews with no matching order',\n       count(*) from (select distinct btrim(order_id) id from raw.reviews_api where order_id is not null) x where not exists (select 1 from orders o where o.id = x.id)\nunion all\nselect 'orders → payments API', 'orders with no payment record',\n       count(*) from orders o where not exists (select 1 from raw.payments_api p where btrim(p.order_id) = o.id)\nunion all\nselect 'products sheet → category tab', 'product categories with no English translation',\n       count(*) from (select distinct category from products where category <> '') x where not exists (select 1 from categories c where c.category = x.category)\nunion all\nselect 'category tab', 'categories translated more than once',\n       count(*) from (select lower(btrim(product_category_name)) from raw.category_translation_sheet group by 1 having count(*) > 1) x\nunion all\nselect 'customers → geolocation', 'customer zip prefixes not found in geolocation',\n       count(*) from (select distinct zip from customers) x where not exists (select 1 from geo g where g.zip = x.zip)\nunion all\nselect 'payments API schema', 'records where payment_value arrived under a different key',\n       count(*) from raw.payments_api where payment_value is null and raw_record ? 'paymentValue'\nunion all\nselect 'reviews API schema', 'records where review_score arrived under a different key',\n       count(*) from raw.reviews_api where review_score is null and raw_record ? 'reviewScore'\nunion all\nselect 'payments API schema', 'empty records',\n       count(*) from raw.payments_api where raw_record = '{}'::jsonb\nunion all\nselect 'reviews API schema', 'empty records',\n       count(*) from raw.reviews_api where raw_record = '{}'::jsonb;",
+        "options": {}
+      },
+      "id": "6ca9367d-e371-5fe5-aaa9-5417b26f3976",
+      "name": "Cross-source checks",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        -80
+      ],
+      "executeOnce": true,
+      "notes": "SQL that compares the raw tables with each other (FR-C3). It looks for: IDs with no match in the related table, orders with no payment, categories with no translation, zip codes missing from geolocation, renamed or missing keys and empty records in the APIs. Values are only trimmed, not cleaned.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const checks = $input.all().map(i => i.json);\nconst loaded = $('Loaded sources').all().map(i => ({ source: i.json.source, type: i.json.type, rows: i.json.rows_written }));\nconst prompt = [\n  'Sources loaded in this run (JSON):',\n  JSON.stringify(loaded),\n  '',\n  'Cross-source check results (JSON):',\n  JSON.stringify(checks),\n].join('\\n');\nreturn [{ json: { prompt, run_id: $('Loaded sources').first().json.run_id } }];"
+      },
+      "id": "a04118b3-0c9e-5dfa-ae8a-bba3a5ee1154",
+      "name": "Build mismatch prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        -80
+      ],
+      "notes": "Puts the check results and the list of loaded sources into one prompt for the Mismatch agent.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are the collection agent in a data pipeline. You review checks that compare raw data sources with each other.\nThe values have only been trimmed; formatting differences (case, leading zeros, extra spaces) are still present and can cause mismatches.\nFlag every check with mismatches > 0. Say which sources disagree, how many records, the most likely cause, and what the cleaning stage should do.\nUse only the numbers you are given. Do not fix anything yourself."
+        }
+      },
+      "id": "9fcefad2-108c-54b8-b856-d01f90d82221",
+      "name": "Mismatch agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1560,
+        -80
+      ],
+      "notes": "AI agent (FR-C3) that reviews the cross-source checks and flags every mismatch. For each one it gives the sources involved, how many records, likely cause and suggested action for the cleaning stage. It does not fix anything.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "claude-sonnet-5-5"
+        },
+        "options": {
+          "maxTokensToSample": 4096,
+          "temperature": 0
+        }
+      },
+      "id": "6b50862f-7ee7-5a24-a811-56d7664523c8",
+      "name": "Mismatch model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [
+        1520,
+        140
+      ],
+      "notes": "The LLM the Mismatch agent uses (Claude Sonnet 5.5, temperature 0). Needs the Anthropic credential.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsonSchemaExample": "{\n  \"mismatches\": [\n    {\n      \"between_sources\": \"order_items → products\",\n      \"check\": \"product_id with no matching product\",\n      \"count\": 15,\n      \"severity\": \"medium\",\n      \"likely_cause\": \"product IDs with extra spaces in the products sheet\",\n      \"suggested_action\": \"trim product_id in both sources before joining\"\n    }\n  ],\n  \"summary\": \"Two or three sentences on how well the sources fit together.\"\n}"
+      },
+      "id": "76a90f6a-dfb6-5c2a-9b77-7ad792acfcc4",
+      "name": "Mismatch output format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        1700,
+        140
+      ],
+      "notes": "Structured Output Parser: forces the Mismatch agent's answer into fixed JSON (a list of mismatches plus a summary).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const meta = $('Build mismatch prompt').first().json;\nreturn [{ json: {\n  run_id: meta.run_id,\n  source: '_cross_source',\n  raw_table: null,\n  contract: JSON.stringify($input.first().json.output),\n} }];"
+      },
+      "id": "b171f174-22ba-5cd5-877a-aecad2c168a3",
+      "name": "Mismatch row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1880,
+        -80
+      ],
+      "notes": "Builds the ops.data_contracts row for the mismatch report, with source '_cross_source'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "data_contracts"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "118f81e0-d687-5a90-b477-ca9c97f94c3b",
+      "name": "Save mismatch report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2100,
+        -80
+      ],
+      "notes": "Writes the mismatch report into ops.data_contracts.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const loaded = $('Loaded sources').all().map(i => i.json);\nconst all = $('Sources').all().map(i => i.json);\nconst report = $('Mismatch agent').first().json.output;\nconst flagged = (report.mismatches ?? []).length;\nreturn [{ json: {\n  run_id: all[0].run_id,\n  agent: 'collection',\n  action: 'run_complete',\n  source: null,\n  target_table: null,\n  status: loaded.length === all.length ? 'success' : 'warning',\n  rows_read: loaded.reduce((n, s) => n + (s.rows_read ?? 0), 0),\n  rows_written: loaded.reduce((n, s) => n + (s.rows_written ?? 0), 0),\n  duration_ms: null,\n  reason: `${loaded.length} of ${all.length} sources loaded; ${flagged} cross-source mismatches flagged`,\n  details: JSON.stringify({ loaded: loaded.map(s => s.source), failed: all.filter(s => !loaded.some(l => l.source === s.source)).map(s => s.source) }),\n} }];"
+      },
+      "id": "bfa8ea45-9f1e-582f-8cb5-ca1679779c16",
+      "name": "Run log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        -80
+      ],
+      "notes": "Builds the final ops.agent_logs row for the whole run: how many sources loaded, total rows, how many mismatches were flagged, and which sources failed.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "01e077a7-c1f7-5828-9d72-b4db61776617",
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2540,
+        -80
+      ],
+      "notes": "Writes the run's final row into ops.agent_logs (action 'run_complete'). This is the last step of the collection stage.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Run collection": {
+      "main": [
+        [
+          {
+            "node": "Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sources": {
+      "main": [
+        [
+          {
+            "node": "Each source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Each source": {
+      "main": [
+        [
+          {
+            "node": "Loaded sources",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "By source type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "By source type": {
+      "main": [
+        [
+          {
+            "node": "Load CSV from Drive",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Sheet tab",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load API source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load CSV from Drive": {
+      "main": [
+        [
+          {
+            "node": "Check result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Sheet tab": {
+      "main": [
+        [
+          {
+            "node": "Check result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load API source": {
+      "main": [
+        [
+          {
+            "node": "Check result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check result": {
+      "main": [
+        [
+          {
+            "node": "Failed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Failed?": {
+      "main": [
+        [
+          {
+            "node": "Failure log row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Each source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Failure log row": {
+      "main": [
+        [
+          {
+            "node": "Log failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log failure": {
+      "main": [
+        [
+          {
+            "node": "Each source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loaded sources": {
+      "main": [
+        [
+          {
+            "node": "Each loaded source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Each loaded source": {
+      "main": [
+        [
+          {
+            "node": "Cross-source checks",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Profile columns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Profile columns": {
+      "main": [
+        [
+          {
+            "node": "Sample rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sample rows": {
+      "main": [
+        [
+          {
+            "node": "Build contract prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build contract prompt": {
+      "main": [
+        [
+          {
+            "node": "Contract agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contract agent": {
+      "main": [
+        [
+          {
+            "node": "Contract row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contract row": {
+      "main": [
+        [
+          {
+            "node": "Save data contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save data contract": {
+      "main": [
+        [
+          {
+            "node": "Each loaded source",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cross-source checks": {
+      "main": [
+        [
+          {
+            "node": "Build mismatch prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build mismatch prompt": {
+      "main": [
+        [
+          {
+            "node": "Mismatch agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mismatch agent": {
+      "main": [
+        [
+          {
+            "node": "Mismatch row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mismatch row": {
+      "main": [
+        [
+          {
+            "node": "Save mismatch report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save mismatch report": {
+      "main": [
+        [
+          {
+            "node": "Run log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run log row": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contract model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Contract agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contract output format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Contract agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mismatch model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Mismatch agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mismatch output format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Mismatch agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

@@ -1,0 +1,1290 @@
+{
+  "id": "olistCleanMain01",
+  "name": "Cleaning · Main",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "e60508a9-2949-5c8a-b59a-dd3096ec19c8",
+      "name": "Run cleaning",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Start here: click 'Execute workflow' to run the cleaning stage once. Run the collection stage first, so the raw tables are filled. In Week 3 the orchestrator calls this instead.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// ==== Settings ===============================================================\nconst ONLY = [];            // e.g. ['sellers'] to clean a few tables; empty = all 9\nconst FRESH_RULES = false;  // true = ask the agent for new rules even when a table already has rules\nconst APPROVAL_FORM_URL = 'http://localhost:5678/form/olist-cleaning-approval';  // Production URL of the approval form\n// =============================================================================\n\nconst runId = 'clean_' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);\n\n// The table contract: one clean table per source, same column names as raw, with their types.\n// It must match scripts/clean_tables.sql. 'checks' are extra counts the agent sees in the profile.\nconst tables = [\n  { source: 'category_translation', raw_table: 'category_translation_sheet', key: ['product_category_name'],\n    columns: { product_category_name: 'text', product_category_name_english: 'text' } },\n  { source: 'sellers', raw_table: 'sellers_csv', key: ['seller_id'],\n    columns: { seller_id: 'text', seller_zip_code_prefix: 'text', seller_city: 'text', seller_state: 'text' } },\n  { source: 'products', raw_table: 'products_sheet', key: ['product_id'],\n    columns: { product_id: 'text', product_category_name: 'text', product_name_lenght: 'integer',\n               product_description_lenght: 'integer', product_photos_qty: 'integer', product_weight_g: 'integer',\n               product_length_cm: 'integer', product_height_cm: 'integer', product_width_cm: 'integer' } },\n  { source: 'customers', raw_table: 'customers_csv', key: ['customer_id'],\n    columns: { customer_id: 'text', customer_unique_id: 'text', customer_zip_code_prefix: 'text',\n               customer_city: 'text', customer_state: 'text' } },\n  { source: 'orders', raw_table: 'orders_csv', key: ['order_id'],\n    columns: { order_id: 'text', customer_id: 'text', order_status: 'text', order_purchase_timestamp: 'timestamp',\n               order_approved_at: 'timestamp', order_delivered_carrier_date: 'timestamp',\n               order_delivered_customer_date: 'timestamp', order_estimated_delivery_date: 'timestamp' },\n    checks: { 'delivered before purchase (only rows where both dates are already YYYY-MM-DD)':\n      'cleaning.try_timestamp(t.order_delivered_customer_date) < cleaning.try_timestamp(t.order_purchase_timestamp)' } },\n  { source: 'order_items', raw_table: 'order_items_csv', key: ['order_id', 'order_item_id'],\n    columns: { order_id: 'text', order_item_id: 'integer', product_id: 'text', seller_id: 'text',\n               shipping_limit_date: 'timestamp', price: 'numeric', freight_value: 'numeric' },\n    checks: { 'price more than 20x the median price of the same product (products sold 3+ times)':\n      't._row in (select s._row from cleaning.order_items s join (select product_id, count(*) as n, ' +\n      'percentile_cont(0.5) within group (order by cleaning.try_numeric(price)) as med ' +\n      'from cleaning.order_items group by product_id) m using (product_id) ' +\n      'where m.n >= 3 and cleaning.try_numeric(s.price) > 20 * m.med)' } },\n  { source: 'payments', raw_table: 'payments_api', key: ['order_id', 'payment_sequential'],\n    columns: { order_id: 'text', payment_sequential: 'integer', payment_type: 'text',\n               payment_installments: 'integer', payment_value: 'numeric' } },\n  { source: 'reviews', raw_table: 'reviews_api', key: ['review_id', 'order_id'],\n    columns: { review_id: 'text', order_id: 'text', review_score: 'smallint', review_comment_title: 'text',\n               review_comment_message: 'text', review_creation_date: 'timestamp', review_answer_timestamp: 'timestamp' },\n    checks: { 'review_score is a number outside 1-5': 'cleaning.try_numeric(t.review_score) not between 1 and 5' } },\n  { source: 'geolocation', raw_table: 'geolocation_csv', key: [],\n    columns: { geolocation_zip_code_prefix: 'text', geolocation_lat: 'double', geolocation_lng: 'double',\n               geolocation_city: 'text', geolocation_state: 'text' },\n    checks: {\n      'latitude outside Brazil (-34 to 6)': \"cleaning.try_numeric(replace(t.geolocation_lat, ',', '.')) not between -34 and 6\",\n      'longitude outside Brazil (-74 to -34)': \"cleaning.try_numeric(replace(t.geolocation_lng, ',', '.')) not between -74 and -34\" } },\n];\n\nreturn tables\n  .filter(t => ONLY.length === 0 || ONLY.includes(t.source))\n  .map(t => {\n    const S = `cleaning.${t.source}`;\n    const api = t.raw_table.endsWith('_api');\n    const copied = [...Object.keys(t.columns), ...(api ? ['raw_record'] : [])];\n    const checks = Object.entries(t.checks ?? {});\n    return { json: {\n      ...t, api, run_id: runId, fresh_rules: FRESH_RULES, approval_form_url: APPROVAL_FORM_URL,\n      // Working copy of the raw table. _row keeps the load order, so \"keep the first row\" is well defined.\n      stage_sql: `drop table if exists ${S};\\n` +\n        `create unlogged table ${S} as select (row_number() over (order by ctid))::int as _row, ${copied.join(', ')} from raw.${t.raw_table};`,\n      duplicate_keys_sql: t.key.length\n        ? `(select count(*) from (select 1 from ${S} t where ${t.key.map(k => `coalesce(btrim(t.${k}), '') <> ''`).join(' and ')} ` +\n          `group by ${t.key.map(k => `btrim(t.${k})`).join(', ')} having count(*) > 1) d)`\n        : 'null',\n      checks_sql: checks.length\n        ? `jsonb_build_object(${checks.map(([name, cond]) => `'${name}', (select count(*) from ${S} t where ${cond})`).join(', ')})`\n        : `'{}'::jsonb`,\n    } };\n  });"
+      },
+      "id": "6ac94ff3-143e-5970-87f2-611c433d01fa",
+      "name": "Tables",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Settings and the table contract. ONLY limits the run to a few tables; FRESH_RULES = true asks the agent for new rules even when a table already has some; APPROVAL_FORM_URL is the link logged when a person must approve rules. Lists the 9 tables with their key, column types and extra checks, and creates the run ID. The types must match scripts/clean_tables.sql.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "078c202b-4efa-52fa-8937-fb3233b90cba",
+      "name": "Each table",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Loop Over Items, one table at a time. 'loop' output = propose rules for the next table; 'done' output = go on to the approval step.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Rules from the latest proposal for this table, if any (no row = never proposed)\nselect run_id, count(*)::int as rules, count(*) filter (where status = 'pending')::int as pending\nfrom ops.cleaning_rules\nwhere source = '{{ $('Each table').first().json.source }}'\n  and run_id = (select run_id from ops.cleaning_rules\n                where source = '{{ $('Each table').first().json.source }}'\n                order by created_at desc limit 1)\ngroup by run_id;",
+        "options": {}
+      },
+      "id": "59775723-9bc3-5a80-b02c-b8fd90e7d979",
+      "name": "Get stored rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        500
+      ],
+      "alwaysOutputData": true,
+      "notes": "Looks up the rules from the latest proposal for this table in ops.cleaning_rules. No row means the table has never had rules ('Always Output Data' is on).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// The agent is asked only when the table has no rules yet, or when FRESH_RULES is on.\n// Otherwise the rules already proposed (and approved or rejected) are used again: no AI call, no new approval.\nconst table = $('Each table').first().json;\nconst stored = $input.first().json;\nconst storedRules = Number(stored.rules ?? 0);\nreturn [{ json: { ...table, needs_rules: table.fresh_rules || storedRules === 0,\n                  stored_run_id: stored.run_id ?? null, stored_rules: storedRules } }];"
+      },
+      "id": "3ebc27be-619a-55c9-bc7f-551d5e754a2f",
+      "name": "Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        500
+      ],
+      "notes": "Deterministic, no AI: new rules are needed when the table has none yet or FRESH_RULES is on. Otherwise the stored rules and their decisions are used again.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needs_rules }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "127cd250-1573-5f9d-81ec-b967e8467ded",
+      "name": "Rules needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        500
+      ],
+      "notes": "true → profile the table and ask the Cleaning agent. false → log that the stored rules are reused and go to the next table.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Rebuild the working copy cleaning.<source> from the raw table. Raw itself is never changed.\n{{ $('Each table').first().json.stage_sql }}\nselect count(*)::int as rows_copied from cleaning.{{ $('Each table').first().json.source }};",
+        "options": {}
+      },
+      "id": "e902e291-01db-5522-b1a8-b525270fa07b",
+      "name": "Build working copy",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        420
+      ],
+      "notes": "Copies raw.<table> into cleaning.<table> (all text) and numbers the rows (_row) in load order. Rules run on this copy; the raw table is never changed.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Profile of every column of the working copy (FR-K1). Pure SQL, no AI. Works for any table.\n-- Tables over 200,000 rows are profiled on a repeatable sample of about 200,000 rows (sampled_pct says how much).\nwith v as (\n    select e.key as col, e.value as val\n    from cleaning.{{ $('Each table').first().json.source }} t\n         {{ $json.rows_copied > 200000 ? `tablesample bernoulli (${Math.ceil(20000000 / $json.rows_copied)}) repeatable (42)` : '' }},\n         jsonb_each_text(to_jsonb(t) - '_row' - 'raw_record') e\n),\nstats as (\n    select col,\n           count(*) filter (where val is null or btrim(val) = '') as blank,\n           count(*) filter (where lower(btrim(val)) in ('n/a', 'na', 'null', 'none', 'nan', '-')) as placeholder_words,\n           count(*) filter (where val <> btrim(val)) as leading_or_trailing_spaces,\n           count(*) filter (where val ~ '\\S\\s{2,}\\S') as double_spaces,\n           count(*) filter (where val ~ '[[:upper:]]') as with_upper_case,\n           count(*) filter (where val ~ '[[:lower:]]') as with_lower_case,\n           count(*) filter (where val <> cleaning.unaccent_pt(val)) as with_accents,\n           count(*) filter (where cleaning.try_numeric(val) is not null) as plain_numbers,\n           count(*) filter (where cleaning.try_numeric(val) < 0) as negative_numbers,\n           min(cleaning.try_numeric(val)) as min_number,\n           percentile_cont(0.5) within group (order by cleaning.try_numeric(val)) as median_number,\n           percentile_cont(0.99) within group (order by cleaning.try_numeric(val)) as p99_number,\n           max(cleaning.try_numeric(val)) as max_number,\n           count(distinct val) as distinct_values\n    from v\n    group by col\n),\nshapes as (     -- the \"shape\" of each value: digits → 9, letters → a/A, 32-char ids → #\n    select col, shape, n, example, first_max, second_max,\n           row_number() over (partition by col order by n desc, shape) as rk\n    from (select col, cleaning.shape(val) as shape, count(*) as n, min(val) as example,\n                 -- for dates like 01/02/2017: the largest first and second number tell day-first from month-first\n                 max(substr(btrim(val), 1, 2)) filter (where btrim(val) ~ '^[0-9]{2}[-/.][0-9]{2}[-/.][0-9]{4}') as first_max,\n                 max(substr(btrim(val), 4, 2)) filter (where btrim(val) ~ '^[0-9]{2}[-/.][0-9]{2}[-/.][0-9]{4}') as second_max\n          from v where btrim(val) <> '' group by col, cleaning.shape(val)) s\n),\ntop_values as (  -- only for columns with few distinct values (status, state, type ...)\n    select col, val, n, row_number() over (partition by col order by n desc, val) as rk\n    from (select col, val, count(*) as n from v\n          where btrim(val) <> '' and col in (select col from stats where distinct_values <= 100)\n          group by col, val) s\n),\nvariants as (    -- the same value written several ways (case, accents, spaces)\n    select col, n, spellings, row_number() over (partition by col order by n desc, norm) as rk\n    from (select col, cleaning.norm(val) as norm, count(*) as n, count(distinct val) as k,\n                 (array_agg(distinct val))[1:6] as spellings\n          from v where btrim(val) <> '' group by col, cleaning.norm(val)) s\n    where k > 1\n)\nselect s.col as column_name,\n       s.blank, s.placeholder_words, s.leading_or_trailing_spaces, s.double_spaces,\n       s.with_upper_case, s.with_lower_case, s.with_accents,\n       s.plain_numbers, s.negative_numbers, s.min_number, s.median_number, s.p99_number, s.max_number,\n       s.distinct_values,\n       (select jsonb_agg(jsonb_strip_nulls(jsonb_build_object('shape', x.shape, 'rows', x.n, 'example', x.example,\n                         'largest_first_number', x.first_max, 'largest_second_number', x.second_max)) order by x.rk)\n          from shapes x where x.col = s.col and x.rk <= 10) as top_shapes,\n       (select jsonb_agg(jsonb_build_object('value', x.val, 'rows', x.n) order by x.rk)\n          from top_values x where x.col = s.col and x.rk <= 40) as top_values,\n       (select count(*) from variants x where x.col = s.col) as values_written_several_ways,\n       (select jsonb_agg(jsonb_build_object('spellings', x.spellings, 'rows', x.n) order by x.rk)\n          from variants x where x.col = s.col and x.rk <= 8) as examples_written_several_ways,\n       {{ $json.rows_copied > 200000 ? Math.ceil(20000000 / $json.rows_copied) : 100 }} as sampled_pct\nfrom stats s\norder by s.col;",
+        "options": {}
+      },
+      "id": "ecc0f45c-a43b-586e-adf3-070cbb4ec5b0",
+      "name": "Profile columns",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        420
+      ],
+      "notes": "FR-K1. SQL profile of every column: blanks, placeholder words, spaces, case, accents, numbers (min, median, p99, max), distinct values, the most common value shapes (e.g. 99/99/9999 99:99), the most common values for low-variety columns, and values written several ways.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Whole-row numbers for the working copy: blank rows, repeated header rows, duplicates, API keys, checks\nselect count(*)::int as total_rows,\n       count(*) filter (where not exists (\n           select 1 from jsonb_each_text(to_jsonb(t) - '_row' - 'raw_record') e\n           where btrim(coalesce(e.value, '')) <> ''))::int as blank_rows,\n       count(*) filter (where (\n           select count(*) from jsonb_each_text(to_jsonb(t) - '_row' - 'raw_record') e\n           where e.value = e.key) >= 2)::int as header_rows,\n       (count(*) - count(distinct to_jsonb(t) - '_row'))::int as exact_duplicate_rows,\n       {{ $('Each table').first().json.duplicate_keys_sql }} as duplicate_keys_after_trimming,\n       (select coalesce(jsonb_object_agg(k, n), '{}'::jsonb)\n          from (select k, count(*) as n\n                from cleaning.{{ $('Each table').first().json.source }} r,\n                     jsonb_object_keys(coalesce(to_jsonb(r) -> 'raw_record', '{}'::jsonb)) k\n                group by k) x) as json_keys,\n       {{ $('Each table').first().json.checks_sql }} as checks\nfrom cleaning.{{ $('Each table').first().json.source }} t;",
+        "options": {}
+      },
+      "id": "fefa44c5-369d-5794-9f6c-f204fda85dab",
+      "name": "Profile table",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        420
+      ],
+      "executeOnce": true,
+      "notes": "Whole-row numbers: total rows, blank rows, repeated header rows, exact duplicates, duplicate keys after trimming, the keys seen in raw_record (API sources), and the extra checks from 'Tables'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- The data contract the collection stage wrote for this source (no row = none yet)\nselect contract\nfrom ops.data_contracts\nwhere source = '{{ $('Each table').first().json.source }}'\norder by created_at desc\nlimit 1;",
+        "options": {}
+      },
+      "id": "ad274523-ea56-5674-a6a2-d63b61a9b17d",
+      "name": "Get contract",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        420
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "notes": "Reads the data contract the collection agent wrote for this source, so the cleaning agent knows the expected types and the problems already spotted.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the prompt from the profile, the table contract and the data contract. No data rows are sent to the LLM.\nconst table = $('Each table').first().json;\nconst tableProfile = $('Profile table').first().json;\nconst contract = $('Get contract').first().json.contract ?? null;\n// Leave out zeros and empty fields, so the prompt stays short\nconst compact = obj => Object.fromEntries(Object.entries(obj).filter(([, v]) =>\n  v !== null && v !== 0 && v !== '0' && !(Array.isArray(v) && v.length === 0)));\nconst columns = $('Profile columns').all().map(i => compact(i.json));\nconst sampled = columns[0]?.sampled_pct < 100 ? ` (counts from a ${columns[0].sampled_pct}% sample)` : '';\ncolumns.forEach(c => delete c.sampled_pct);\n\nconst prompt = [\n  `Source: ${table.source}`,\n  `Working copy: cleaning.${table.source} (${tableProfile.total_rows} rows, every value is text)`,\n  `Target: clean.${table.source} with these column types: ${JSON.stringify(table.columns)}`,\n  `Primary key: ${table.key.length ? table.key.join(', ') : 'none (rows can repeat)'}`,\n  table.api ? 'This is an API source. raw_record holds each original JSON record; json_keys counts the keys seen in it.' : '',\n  '',\n  'Table profile (JSON):',\n  JSON.stringify(tableProfile),\n  '',\n  `Column profile${sampled} (JSON):`,\n  JSON.stringify(columns),\n  '',\n  contract ? 'Data contract written by the collection agent (JSON):' : 'No data contract is stored for this source.',\n  contract ? JSON.stringify(contract) : '',\n].join('\\n');\nreturn [{ json: { prompt } }];"
+      },
+      "id": "2d8301ce-b244-5168-b841-c8cd93200414",
+      "name": "Build rules prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        260
+      ],
+      "notes": "Puts the target column types, the profiles and the data contract into one prompt. Zeros and empty fields are left out to keep it short. No data rows are sent.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are the cleaning agent in a data pipeline. You propose cleaning rules for one table.\nYou get a profile of the table (every value is still text) and the target column types. Propose the rules that turn\nthe values into clean values of the target type, using ONLY the rule types below. You never write SQL.\n\nThe system checks every rule, runs a dry run to count the rows it changes, applies safe rules automatically and\nsends risky ones (deleting rows, changing what values mean, reading dates) to a person for approval.\n\nRules always run in this fixed order, whatever order you list them in:\nrename_key → drop_blank_rows, drop_header_rows, drop_rows_matching → dedupe_exact → trim, null_words →\nchange_case, remove_accents → map_values → scale → strip_text, replace_text → decimal_comma, words_to_numbers → lpad →\nparse_date → swap_columns → set_value → dedupe_key\n\nRule types (column = the column the rule changes; null for whole-row rules):\n- drop_blank_rows {}: remove rows where every column is empty.\n- drop_header_rows {}: remove rows that repeat the column names.\n- drop_rows_matching {\"pattern\": \"^test_\"}: remove rows whose column matches a regex (e.g. test records).\n- dedupe_exact {}: remove rows that are exact copies of an earlier row.\n- dedupe_key {\"columns\": [\"order_id\"]}: keep only the first row per key. Runs last, so near-duplicates that differ\n  only in formatting are caught.\n- rename_key {\"from_key\": \"paymentValue\"}: API sources only. Fill the column from raw_record ->> from_key when the\n  column is empty, for records where the field arrived under another name (see json_keys).\n- trim {}: remove leading/trailing spaces and double spaces.\n- null_words {\"words\": [\"N/A\", \"null\"]}: turn empty text and these placeholder words into null.\n- change_case {\"to\": \"lower\" | \"upper\"}\n- remove_accents {}: São Paulo → Sao Paulo.\n- map_values {\"mapping\": {\"Sao Paulo\": \"SP\"}}: replace whole values. Matching ignores case, accents and extra spaces.\n- scale {\"pattern\": \"kg$\", \"factor\": 1000}: for values matching the regex, keep the number and multiply it.\n- strip_text {\"pattern\": \"^R\\\\$\\\\s*\"}: remove text matching a regex anchored with ^ or $, e.g. a currency sign,\n  a unit or a suffix such as \"x\" or \" stars\". Matching ignores case.\n- replace_text {\"pattern\": \"[ -]+\", \"replacement\": \"_\"}: replace every match of a regex inside the values\n  (e.g. make \"beleza saude\" and \"beleza-saude\" read \"beleza_saude\"). Matching ignores case.\n- decimal_comma {}: 12,50 → 12.50 (also 1.234,50 → 1234.50).\n- words_to_numbers {}: zero ... ten → 0 ... 10.\n- lpad {\"length\": 5, \"char\": \"0\"}: put back leading zeros on codes that lost them.\n- parse_date {\"formats\": [...]}: rewrite dates to YYYY-MM-DD HH:MI:SS. Name every non-standard format you see, from:\n  \"DD/MM/YYYY HH:MI:SS\", \"DD/MM/YYYY HH:MI\", \"DD/MM/YYYY\", \"MM/DD/YYYY HH:MI\", \"MM/DD/YYYY\", \"MM-DD-YYYY HH:MI\",\n  \"MM-DD-YYYY\", \"DD-MM-YYYY\", \"YYYY-MM-DD\", \"YYYY/MM/DD\", \"ISO T/Z\" (2017-10-02T10:56:33Z).\n  Two formats with the same shape (DD/MM/YYYY and MM/DD/YYYY) cannot both be used: pick the one the values support\n  (a first number above 12 means day first).\n- swap_columns {\"other_column\": \"...\", \"conditions\": [...]}: swap the values of column and other_column in rows\n  that meet all conditions (e.g. latitude and longitude swapped, or two dates in the wrong columns).\n- set_value {\"action\": \"abs\" | \"negate\" | \"null\" | \"divide\", \"divisor\": 100, \"conditions\": [...]}: change values\n  of the column in rows that meet all conditions.\nConditions: {\"column\": \"...\", \"op\": \"lt\" | \"gt\" | \"le\" | \"ge\" | \"between\" | \"not_between\" | \"matches\" |\n\"before_column\" | \"gt_median_x\", \"value\": ..., \"value2\": ..., \"other_column\": \"...\", \"group_by\": \"...\"}\n  lt/gt/le/ge/between/not_between compare the column as a number with value (and value2).\n  matches: the column matches the regex in value. before_column: the column (a date) is earlier than other_column.\n  gt_median_x: the column is more than value times the median of the column within the same group_by value\n  (groups with 3 or more rows), e.g. a price 100x too high for that product.\n\nGuidance:\n- Base every rule on numbers you can see in the profile, the checks or the data contract. Do not guess.\n- Clean text values should look like the majority form shown in top_values (e.g. lower-case city names without\n  accents, two-letter upper-case state codes).\n- Every value must end up castable to the target type: integer, smallint, numeric, double, timestamp or text.\n- One rule per problem and column. Each rule's reason is one plain sentence a non-technical approver can follow.\n- confidence is 0 to 1: how sure you are the rule is right for all rows it changes."
+        }
+      },
+      "id": "58212454-d9d0-586e-bda6-3334643b0bf4",
+      "name": "Cleaning agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        2200,
+        420
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "AI agent (FR-K2). Proposes cleaning rules as JSON, picking only from a fixed list of rule types (trim, parse_date, dedupe_key ...) with their settings, a reason and a confidence. It never writes SQL and never decides what is safe. Set to continue on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "maxOutputTokens": 24576,
+          "temperature": 0
+        }
+      },
+      "id": "907b36f3-4396-5004-86b9-eb0bde12cd50",
+      "name": "Cleaning model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        2160,
+        640
+      ],
+      "notes": "The LLM the Cleaning agent uses (Gemini 2.5 Flash, temperature 0). Needs the Gemini credential, like the collection agents.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"rules\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"rule_type\": {\n            \"type\": \"string\"\n          },\n          \"column\": {\n            \"type\": [\n              \"string\",\n              \"null\"\n            ]\n          },\n          \"params\": {\n            \"type\": \"object\"\n          },\n          \"reason\": {\n            \"type\": \"string\"\n          },\n          \"confidence\": {\n            \"type\": \"number\"\n          }\n        },\n        \"required\": [\n          \"rule_type\",\n          \"column\",\n          \"params\",\n          \"reason\",\n          \"confidence\"\n        ]\n      }\n    },\n    \"summary\": {\n      \"type\": \"string\",\n      \"description\": \"Two or three sentences on the main problems in this table\"\n    }\n  },\n  \"required\": [\n    \"rules\",\n    \"summary\"\n  ]\n}"
+      },
+      "id": "cd5b8103-3990-5914-b374-e28e5f59916b",
+      "name": "Cleaning output format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        2340,
+        640
+      ],
+      "notes": "Structured Output Parser with a fixed JSON schema: a list of rules (rule_type, column, params, reason, confidence) and a summary.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check the agent's rules, sort them into safe and risky with a fixed policy (not the LLM), and turn each rule\n// into SQL from a template. Unknown rule types, unknown columns or bad settings are kept as 'invalid' and never run.\nconst table = $('Each table').first().json;\nconst agent = $input.first().json;\nconst S = `cleaning.${table.source}`;\nconst columns = Object.keys(table.columns);\nconst jsonKeys = Object.keys($('Profile table').first().json.json_keys ?? {});\n\n// ---- SQL building blocks: every value from the agent goes through one of these ----\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst num = v => {\n  const n = Number(v);\n  if (v === null || v === undefined || v === '' || !Number.isFinite(n)) throw new Error(`\"${v}\" is not a number`);\n  return String(n);\n};\nconst col = c => {\n  if (!columns.includes(c)) throw new Error(`unknown column \"${c}\"`);\n  return `t.${c}`;\n};\nconst regex = p => {\n  if (typeof p !== 'string' || p.length === 0 || p.length > 120) throw new Error('pattern missing or longer than 120 characters');\n  new RegExp(p);  // throws on an invalid pattern\n  return lit(p);\n};\nconst loose = v => String(v).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[\\s_-]+/g, '').toLowerCase();\n\nconst DATE_FORMATS = {  // name the agent uses → [pattern that recognises it, to_timestamp() format]\n  'DD/MM/YYYY HH:MI:SS': ['^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2}$', 'DD/MM/YYYY HH24:MI:SS'],\n  'DD/MM/YYYY HH:MI': ['^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}$', 'DD/MM/YYYY HH24:MI'],\n  'DD/MM/YYYY': ['^[0-9]{2}/[0-9]{2}/[0-9]{4}$', 'DD/MM/YYYY'],\n  'MM/DD/YYYY HH:MI': ['^[0-9]{2}/[0-9]{2}/[0-9]{4} [0-9]{2}:[0-9]{2}$', 'MM/DD/YYYY HH24:MI'],\n  'MM/DD/YYYY': ['^[0-9]{2}/[0-9]{2}/[0-9]{4}$', 'MM/DD/YYYY'],\n  'MM-DD-YYYY HH:MI': ['^[0-9]{2}-[0-9]{2}-[0-9]{4} [0-9]{2}:[0-9]{2}$', 'MM-DD-YYYY HH24:MI'],\n  'MM-DD-YYYY': ['^[0-9]{2}-[0-9]{2}-[0-9]{4}$', 'MM-DD-YYYY'],\n  'DD-MM-YYYY': ['^[0-9]{2}-[0-9]{2}-[0-9]{4}$', 'DD-MM-YYYY'],\n  'YYYY-MM-DD': ['^[0-9]{4}-[0-9]{2}-[0-9]{2}$', 'YYYY-MM-DD'],\n  'YYYY/MM/DD': ['^[0-9]{4}/[0-9]{2}/[0-9]{2}$', 'YYYY/MM/DD'],\n  'ISO T/Z': ['^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\\\.[0-9]+)?Z?$', 'YYYY-MM-DD\"T\"HH24:MI:SS'],\n};\nconst WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];\n\nfunction condition(c) {\n  const x = col(c.column);\n  switch (c.op) {\n    case 'lt': return `cleaning.try_numeric(${x}) < ${num(c.value)}`;\n    case 'gt': return `cleaning.try_numeric(${x}) > ${num(c.value)}`;\n    case 'le': return `cleaning.try_numeric(${x}) <= ${num(c.value)}`;\n    case 'ge': return `cleaning.try_numeric(${x}) >= ${num(c.value)}`;\n    case 'between': return `cleaning.try_numeric(${x}) between ${num(c.value)} and ${num(c.value2)}`;\n    case 'not_between': return `cleaning.try_numeric(${x}) not between ${num(c.value)} and ${num(c.value2)}`;\n    case 'matches': return `${x} ~* ${regex(c.value)}`;\n    case 'before_column': return `cleaning.try_timestamp(${x}) < cleaning.try_timestamp(${col(c.other_column)})`;\n    case 'gt_median_x': {\n      const g = col(c.group_by).slice(2);\n      const v = c.column;\n      return `t._row in (select s._row from ${S} s join (select m.${g}, count(*) as n, ` +\n        `percentile_cont(0.5) within group (order by cleaning.try_numeric(m.${v})) as med from ${S} m group by m.${g}) m ` +\n        `on m.${g} = s.${g} where m.n >= 3 and cleaning.try_numeric(s.${v}) > ${num(c.value)} * m.med)`;\n    }\n    default: throw new Error(`unknown condition op \"${c.op}\"`);\n  }\n}\nconst conditions = list => {\n  if (!Array.isArray(list) || list.length === 0) throw new Error('at least one condition is needed');\n  return list.map(c => `(${condition(c)})`).join(' and ');\n};\nconst partitionedDuplicates = cols =>\n  `t._row in (select d._row from (select s._row, row_number() over (partition by ${cols.map(c => `s.${c}`).join(', ')} ` +\n  `order by s._row) as rn from ${S} s) d where d.rn > 1)`;\n\n// ---- the rule catalogue: run order, risk policy, and the SQL each rule becomes ----\n// risky: false = safe (applied automatically), a text = why a person must approve it, or a function deciding that.\nconst update = (column, cond, expr, nullOnReject = true) => ({ kind: 'update', column, cond, expr, nullOnReject });\nconst RULES = {\n  rename_key: { order: 0, risky: 'fills a column from a field with a different name', compile: (c, p) => {\n    if (!table.api) throw new Error('rename_key is only for API sources');\n    if (!jsonKeys.includes(p.from_key)) throw new Error(`key \"${p.from_key}\" does not appear in raw_record`);\n    return update(c, `coalesce(btrim(${col(c)}), '') = '' and t.raw_record ? ${lit(p.from_key)}`,\n                  `t.raw_record ->> ${lit(p.from_key)}`, false);\n  } },\n  drop_blank_rows: { order: 1, risky: false, row: true, compile: () => ({ kind: 'delete',\n    cond: columns.map(c => `coalesce(btrim(t.${c}), '') = ''`).join(' and ') }) },\n  drop_header_rows: { order: 1, risky: false, row: true, compile: () => ({ kind: 'delete',\n    cond: `(${columns.map(c => `(t.${c} = ${lit(c)})::int`).join(' + ')}) >= ${Math.min(2, columns.length)}` }) },\n  drop_rows_matching: { order: 1, risky: 'removes rows', compile: (c, p) => ({ kind: 'delete', quarantine: true,\n    cond: `${col(c)} ~* ${regex(p.pattern)}` }) },\n  dedupe_exact: { order: 2, risky: false, row: true, compile: () => ({ kind: 'delete',\n    cond: partitionedDuplicates(table.api ? [...columns, 'raw_record::text'] : columns) }) },\n  trim: { order: 3, risky: false, compile: c => {\n    const x = col(c), expr = `btrim(regexp_replace(${x}, '\\\\s+', ' ', 'g'))`;\n    return update(c, `${x} <> ${expr}`, expr);\n  } },\n  null_words: { order: 3, risky: false, compile: (c, p) => {\n    const words = (Array.isArray(p.words) ? p.words : []).map(w => lit(String(w).trim().toLowerCase()));\n    return update(c, `btrim(${col(c)}) = ''` + (words.length ? ` or lower(btrim(${col(c)})) in (${words.join(', ')})` : ''), 'null', false);\n  } },\n  change_case: { order: 4, risky: false, compile: (c, p) => {\n    if (!['lower', 'upper'].includes(p.to)) throw new Error('\"to\" must be lower or upper');\n    return update(c, `${col(c)} <> ${p.to}(${col(c)})`, `${p.to}(${col(c)})`);\n  } },\n  remove_accents: { order: 4, risky: false, compile: c =>\n    update(c, `${col(c)} <> cleaning.unaccent_pt(${col(c)})`, `cleaning.unaccent_pt(${col(c)})`) },\n  map_values: { order: 5,\n    risky: p => Object.entries(p.mapping ?? {}).every(([from, to]) => loose(from) === loose(to))\n      ? false : 'replaces values with different text',\n    compile: (c, p) => {\n      const entries = Object.entries(p.mapping ?? {});\n      if (entries.length === 0 || entries.length > 200) throw new Error('mapping needs 1 to 200 entries');\n      const x = col(c);\n      const expr = `case cleaning.norm(${x}) ${entries.map(([from, to]) => `when cleaning.norm(${lit(from)}) then ${lit(to)}`).join(' ')} else ${x} end`;\n      return update(c, `cleaning.norm(${x}) in (${entries.map(([from]) => `cleaning.norm(${lit(from)})`).join(', ')}) and ${x} is distinct from ${expr}`, expr);\n    } },\n  scale: { order: 6, risky: 'changes the size of numbers', compile: (c, p) => {\n    const x = col(c);\n    return update(c, `${x} ~* ${regex(p.pattern)}`,\n      `trim_scale(cleaning.try_numeric(replace(regexp_replace(${x}, '[^0-9,.-]', '', 'g'), ',', '.')) * ${num(p.factor)})::text`);\n  } },\n  strip_text: { order: 7,\n    risky: p => typeof p.pattern === 'string' && (p.pattern.startsWith('^') || p.pattern.endsWith('$'))\n      ? false : 'removes text from the middle of values',\n    compile: (c, p) => {\n      const x = col(c), pattern = regex(p.pattern);\n      return update(c, `${x} ~* ${pattern}`, `btrim(regexp_replace(${x}, ${pattern}, '', 'gi'))`);\n    } },\n  replace_text: { order: 7, risky: 'replaces text inside values', compile: (c, p) => {\n    const x = col(c), pattern = regex(p.pattern);\n    if (typeof p.replacement !== 'string' || p.replacement.length > 40) throw new Error('replacement must be text of up to 40 characters');\n    return update(c, `${x} ~* ${pattern}`, `regexp_replace(${x}, ${pattern}, ${lit(p.replacement)}, 'gi')`);\n  } },\n  decimal_comma: { order: 8, risky: false, compile: c => {\n    const x = col(c);\n    return update(c, `${x} ~ '^\\\\s*-?[0-9.]*,[0-9]+\\\\s*$'`, `replace(replace(btrim(${x}), '.', ''), ',', '.')`);\n  } },\n  words_to_numbers: { order: 8, risky: false, compile: c => {\n    const x = col(c);\n    return update(c, `lower(btrim(${x})) in (${WORDS.map(lit).join(', ')})`,\n      `case lower(btrim(${x})) ${WORDS.map((w, i) => `when ${lit(w)} then '${i}'`).join(' ')} end`);\n  } },\n  lpad: { order: 9, risky: false, compile: (c, p) => {\n    const length = Number(num(p.length ?? 5)), ch = String(p.char ?? '0');\n    if (length < 1 || length > 20 || ch.length !== 1) throw new Error('length must be 1-20 and char one character');\n    return update(c, `${col(c)} ~ '^[0-9]+$' and length(${col(c)}) < ${length}`, `lpad(${col(c)}, ${length}, ${lit(ch)})`);\n  } },\n  parse_date: { order: 10, risky: 'reads dates written in other formats; day and month could be swapped', compile: (c, p) => {\n    const names = (Array.isArray(p.formats) ? p.formats : []).filter(n => n !== 'YYYY-MM-DD HH:MI:SS');\n    if (names.length === 0) throw new Error('no date formats given');\n    const formats = names.map(n => {\n      if (!DATE_FORMATS[n]) throw new Error(`unknown date format \"${n}\"`);\n      return [n, ...DATE_FORMATS[n]];\n    });\n    if (new Set(formats.map(f => f[1])).size !== formats.length) {\n      throw new Error('two formats have the same shape (e.g. DD/MM/YYYY and MM/DD/YYYY); only one can be used');\n    }\n    const x = col(c);\n    const value = n => n === 'ISO T/Z' ? `left(btrim(${x}), 19)` : `btrim(${x})`;\n    const expr = `case ${formats.map(([n, re, fmt]) =>\n      `when btrim(${x}) ~ ${lit(re)} then to_char(cleaning.try_to_timestamp(${value(n)}, ${lit(fmt)}), 'YYYY-MM-DD HH24:MI:SS')`).join(' ')} end`;\n    return update(c, `(${formats.map(([, re]) => `btrim(${x}) ~ ${lit(re)}`).join(' or ')})`, expr);\n  } },\n  swap_columns: { order: 11, risky: 'moves values between two columns', compile: (c, p) => {\n    if (p.other_column === c) throw new Error('other_column must be a different column');\n    col(p.other_column);\n    return { kind: 'swap', column: c, other: p.other_column, cond: conditions(p.conditions) };\n  } },\n  set_value: { order: 12, risky: 'changes what values mean', compile: (c, p) => {\n    const x = col(c), numeric = `cleaning.try_numeric(${x})`;\n    const cond = conditions(p.conditions);\n    switch (p.action) {\n      case 'abs': return update(c, `${numeric} is not null and ${cond}`, `abs(${numeric})::text`);\n      case 'negate': return update(c, `${numeric} is not null and ${cond}`, `(-${numeric})::text`);\n      case 'divide': {\n        if (Number(num(p.divisor)) === 0) throw new Error('divisor cannot be 0');\n        return update(c, `${numeric} is not null and ${cond}`, `trim_scale(round(${numeric} / ${num(p.divisor)}, 6))::text`);\n      }\n      case 'null': return update(c, `${x} is not null and ${cond}`, 'null', false);\n      default: throw new Error('action must be abs, negate, null or divide');\n    }\n  } },\n  dedupe_key: { order: 13, risky: 'removes rows that are not exact copies', row: true, compile: (c, p) => {\n    const keys = Array.isArray(p.columns) && p.columns.length ? p.columns : [c];\n    keys.forEach(col);\n    return { kind: 'delete', quarantine: true,\n      cond: `${keys.map(k => `coalesce(btrim(t.${k}), '') <> ''`).join(' and ')} and ${partitionedDuplicates(keys)}` };\n  } },\n};\n\n// ---- statements: each one records rows affected and up to 3 examples in _results ----\nconst examples = (e, cond) =>\n  `(select coalesce(jsonb_agg(x.e), '[]'::jsonb) from (select ${e} as e from ${S} t where ${cond} limit 3) x)`;\nconst counted = (id, sample, dml, cte = 'changed') => [\n  `insert into _results (rule_id, examples) select ${lit(id)}, ${sample};`,\n  `with ${dml}`,\n  `update _results set rows_affected = (select count(*) from ${cte}) where rule_id = ${lit(id)};`,\n].join('\\n');\n\nfunction statements(id, spec, reason) {\n  if (spec.kind === 'update') {\n    const c = spec.column, x = `t.${c}`;\n    const apply = counted(id, examples(`jsonb_build_object('before', ${x}, 'after', ${spec.expr})`, spec.cond),\n      `changed as (update ${S} t set ${c} = ${spec.expr} where ${spec.cond} returning 1)`);\n    const reject = spec.nullOnReject && spec.expr !== 'null'\n      ? counted(id, examples(`jsonb_build_object('before', ${x}, 'after', null)`, spec.cond),\n          `changed as (update ${S} t set ${c} = null where ${spec.cond} returning 1)`)\n      : null;\n    return [apply, reject];\n  }\n  if (spec.kind === 'swap') {\n    const a = spec.column, b = spec.other;\n    const apply = counted(id, examples(`jsonb_build_object('before', jsonb_build_array(t.${a}, t.${b}), 'after', jsonb_build_array(t.${b}, t.${a}))`, spec.cond),\n      `changed as (update ${S} t set ${a} = t.${b}, ${b} = t.${a} where ${spec.cond} returning 1)`);\n    const reject = counted(id, examples(`jsonb_build_object('before', jsonb_build_array(t.${a}, t.${b}), 'after', jsonb_build_array(null, null))`, spec.cond),\n      `changed as (update ${S} t set ${a} = null, ${b} = null where ${spec.cond} returning 1)`);\n    return [apply, reject];\n  }\n  // delete: rows whose content is lost go to ops.quarantine (only in the real run, not the dry run)\n  const keep = spec.quarantine\n    ? `, kept as (insert into ops.quarantine (run_id, source, rule_id, reason, record) ` +\n      `select r.run_id, ${lit(table.source)}, ${lit(id)}, ${lit(reason)}, to_jsonb(gone) - '_row' from gone, _run r where r.mode = 'apply')`\n    : '';\n  const apply = counted(id, examples(`to_jsonb(t) - '_row' - 'raw_record'`, spec.cond),\n    `gone as (delete from ${S} t where ${spec.cond} returning t.*)${keep}`, 'gone');\n  return [apply, null];\n}\n\n// ---- check every proposed rule ----\nconst proposed = Array.isArray(agent.output?.rules) ? agent.output.rules : [];\nconst seen = new Set();\nconst checked = proposed.map((rule, index) => {\n  const type = String(rule.rule_type ?? '');\n  const def = RULES[type];\n  const column = rule.column || null;\n  const params = rule.params && typeof rule.params === 'object' ? rule.params : {};\n  const confidence = Number.isFinite(Number(rule.confidence)) ? Number(rule.confidence) : 0;\n  const base = { index, rule_type: type, column_name: column, params, reason: String(rule.reason ?? ''), confidence };\n  try {\n    if (!def) throw new Error(`unknown rule type \"${type}\"`);\n    if (!def.row && type !== 'drop_rows_matching' && !column) throw new Error('column is missing');\n    const signature = JSON.stringify([type, def.row ? null : column, params]);\n    if (seen.has(signature)) throw new Error('same rule proposed twice');\n    seen.add(signature);\n    const spec = def.compile(def.row ? column : column, params);\n    let risk = typeof def.risky === 'function' ? def.risky(params) : def.risky;\n    if (!risk && confidence < 0.8) risk = 'has agent confidence below 0.8';\n    const columnName = type === 'dedupe_key' ? (params.columns ?? [column]).join(', ') : (def.row ? null : column);\n    return { ...base, column_name: columnName, order: def.order, spec, risk: risk ? 'risky' : 'safe', risk_reason: risk || null };\n  } catch (error) {\n    return { ...base, order: 99, spec: null, risk: null, risk_reason: error.message };\n  }\n});\nif (checked.length === 0) {\n  const why = agent.error ? `the agent failed: ${agent.error.message ?? agent.error}` : 'the agent proposed no rules';\n  checked.push({ index: 0, rule_type: 'none', column_name: null, params: {}, reason: why, confidence: 0,\n                 order: 99, spec: null, risk: null, risk_reason: why });\n}\n\nchecked.sort((a, b) => a.order - b.order || a.index - b.index);\nconst rules = checked.map((r, i) => {\n  const rule_id = `${table.run_id}:${table.source}:${String(i + 1).padStart(2, '0')}`;\n  const [sql, reject_sql] = r.spec ? statements(rule_id, r.spec, `${r.rule_type}: ${r.reason}`) : [null, null];\n  return {\n    rule_id, run_id: table.run_id, source: table.source, rule_order: i + 1, rule_type: r.rule_type,\n    column_name: r.column_name, params: r.params, reason: r.reason, confidence: r.confidence,\n    risk: r.risk, risk_reason: r.risk_reason,\n    status: r.spec ? (r.risk === 'safe' ? 'auto' : 'pending') : 'invalid',\n    sql, reject_sql,\n  };\n});\n\n// Dry run: apply every valid rule to the working copy in order, to count the rows each one changes\nconst preview_sql = [\n  `create temp table _run on commit drop as select ${lit(table.run_id)}::text as run_id, 'preview'::text as mode;`,\n  `create temp table _results (rule_id text, rows_affected integer, examples jsonb) on commit drop;`,\n  ...rules.filter(r => r.sql).map(r => r.sql),\n  `select rule_id, rows_affected, examples from _results;`,\n].join('\\n');\n\nreturn [{ json: { rules, preview_sql, summary: agent.output?.summary ?? '' } }];"
+      },
+      "id": "66cc1452-3fbc-5821-8b76-5f604e218a34",
+      "name": "Check rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        420
+      ],
+      "notes": "Deterministic, no AI. Validates every rule (known type, known column, sensible settings), drops duplicates, sorts rules into the fixed run order, decides safe or risky with a fixed policy (FR-K3), and turns each rule into SQL from a template. Risky = deletes rows that are not exact copies, changes what values mean, reads dates, or confidence below 0.8.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Dry run on the working copy: counts and examples per rule. Nothing is written to clean.* here.\n{{ $json.preview_sql }}",
+        "options": {}
+      },
+      "id": "0b08c48d-0a6b-526d-873e-96b6fe989018",
+      "name": "Dry run rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2740,
+        420
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "notes": "Runs all valid rules on the working copy and records, per rule, the rows it changed and up to 3 examples (before → after). Writes nothing to clean.*. Continues on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// One ops.cleaning_rules row per rule, with the dry-run count and examples.\n// If the dry run failed, no rule of this table is trusted: all are marked invalid.\nconst proposal = $('Check rules').first().json;\nconst dry = $input.all().map(i => i.json);\nconst failed = dry.find(r => r.error);\nconst byId = Object.fromEntries(dry.filter(r => r.rule_id).map(r => [r.rule_id, r]));\nreturn proposal.rules.map(r => {\n  const broken = failed && r.status !== 'invalid';\n  return { json: {\n    rule_id: r.rule_id, run_id: r.run_id, source: r.source, rule_order: r.rule_order,\n    rule_type: r.rule_type, column_name: r.column_name, params: JSON.stringify(r.params),\n    reason: r.reason, confidence: r.confidence, risk: r.risk,\n    risk_reason: broken ? `dry run failed: ${failed.message ?? failed.error?.message ?? failed.error}` : r.risk_reason,\n    status: broken ? 'invalid' : r.status,\n    rows_affected: byId[r.rule_id]?.rows_affected ?? null,\n    examples: JSON.stringify(byId[r.rule_id]?.examples ?? []),\n    sql: r.sql, reject_sql: r.reject_sql,\n  } };\n});"
+      },
+      "id": "b333fa77-263a-53ad-aaa8-dd836dd424ac",
+      "name": "Rule rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2960,
+        420
+      ],
+      "notes": "Builds one ops.cleaning_rules row per rule: settings, reason, confidence, risk, status (auto = safe, pending = waits for approval, invalid = never runs), dry-run count, examples and the SQL. If the dry run failed, every rule of the table is marked invalid.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "cleaning_rules"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "324ac841-0af4-5e0a-beb8-20d2a172d8f4",
+      "name": "Save rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3180,
+        420
+      ],
+      "notes": "Writes the rules into ops.cleaning_rules.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const table = $('Each table').first().json;\nconst rules = $('Rule rows').all().map(i => i.json);\nconst count = status => rules.filter(r => r.status === status).length;\nconst invalid = count('invalid');\nreturn [{ json: {\n  run_id: table.run_id,\n  agent: 'cleaning',\n  action: 'propose_rules',\n  source: table.source,\n  target_table: `clean.${table.source}`,\n  status: invalid === rules.length ? 'failed' : invalid ? 'warning' : 'success',\n  rows_read: $('Profile table').first().json.total_rows,\n  rows_written: null,\n  duration_ms: null,\n  reason: `${rules.length - invalid} rules proposed: ${count('auto')} safe (applied automatically), ` +\n          `${count('pending')} risky (waiting for approval), ${invalid} invalid`,\n  details: JSON.stringify({\n    summary: $('Check rules').first().json.summary,\n    invalid: rules.filter(r => r.status === 'invalid').map(r => ({ rule_type: r.rule_type, column: r.column_name, why: r.risk_reason })),\n  }),\n} }];"
+      },
+      "id": "07a687ec-b9d9-5327-80bc-15ebd02cfe84",
+      "name": "Proposal log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3400,
+        420
+      ],
+      "executeOnce": true,
+      "notes": "Builds the ops.agent_logs row for the proposal: how many rules are safe, risky and invalid, and the agent's summary.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "b13538f1-7d18-5b1b-a42a-a32dcc808936",
+      "name": "Log proposal",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3620,
+        420
+      ],
+      "notes": "Writes the proposal log row, then goes back to 'Each table'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const t = $input.first().json;\nreturn [{ json: {\n  run_id: t.run_id, agent: 'cleaning', action: 'reuse_rules', source: t.source, target_table: `clean.${t.source}`,\n  status: 'success', rows_read: null, rows_written: null, duration_ms: null,\n  reason: `Using the ${t.stored_rules} rules proposed in ${t.stored_run_id} (no AI call). Set FRESH_RULES = true for new ones.`,\n  details: JSON.stringify({ proposal_run_id: t.stored_run_id }),\n} }];"
+      },
+      "id": "d9bede35-55bc-5daf-9b70-9844801d7b9c",
+      "name": "Reuse log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        700
+      ],
+      "notes": "Builds the ops.agent_logs row saying the stored rules are used again (no AI call).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "918d38db-a863-53a5-ba3e-455c9451b4b8",
+      "name": "Log reuse",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        700
+      ],
+      "notes": "Writes the reuse log row, then goes back to 'Each table'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Risky rules nobody has decided on yet\nselect count(*)::int as pending from ops.cleaning_rules where status = 'pending';",
+        "options": {}
+      },
+      "id": "d64745e9-f464-51ae-acd1-34b60615e433",
+      "name": "Count pending rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        40
+      ],
+      "executeOnce": true,
+      "notes": "Counts the risky rules that still need a decision.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.pending }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ff1ae969-4185-5176-bfff-b081966a093d",
+      "name": "Needs approval?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        40
+      ],
+      "notes": "true → ask a person and wait. false → no risky rule is waiting, go straight to applying.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// $execution.resumeUrl is the address that wakes up this run at the 'Wait for approval' node.\n// The approval form calls it after the decisions are saved.\nconst run = $('Tables').first().json;\nreturn [{ json: { run_id: run.run_id, resume_url: $execution.resumeUrl, status: 'waiting',\n                  rules_pending: $('Count pending rules').first().json.pending } }];"
+      },
+      "id": "0f14f4d8-73ce-5aed-ae21-2793e75310b1",
+      "name": "Approval request row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -100
+      ],
+      "notes": "Builds the ops.cleaning_approvals row with this run's resume URL. The approval form calls that URL after the decisions are saved, which wakes this run up.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "cleaning_approvals"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "c334f1ca-20e5-5a32-9e5c-d6d1f8650cda",
+      "name": "Save approval request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        -100
+      ],
+      "notes": "Writes the approval request into ops.cleaning_approvals.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const run = $('Tables').first().json;\nconst pending = $('Count pending rules').first().json.pending;\nreturn [{ json: {\n  run_id: run.run_id, agent: 'cleaning', action: 'awaiting_approval', source: null, target_table: null,\n  status: 'warning', rows_read: null, rows_written: null, duration_ms: null,\n  reason: `${pending} risky rules need a decision. Open ${run.approval_form_url}`,\n  details: JSON.stringify({ approval_form_url: run.approval_form_url }),\n} }];"
+      },
+      "id": "7c9440b6-2ca5-5aca-83c0-6046c88c7a48",
+      "name": "Waiting log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        -100
+      ],
+      "notes": "Builds an ops.agent_logs row with the number of risky rules and the approval form link.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "4b948253-6b03-5768-87f6-c6341e9623fa",
+      "name": "Log waiting",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        -100
+      ],
+      "notes": "Writes the waiting log row. Open the form link from this row (or from 'Tables').",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "POST",
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 2,
+        "resumeUnit": "hours",
+        "options": {}
+      },
+      "id": "aa3d0fc8-1039-5823-87ea-9ba882365057",
+      "name": "Wait for approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1980,
+        -100
+      ],
+      "webhookId": "e7ed5aa6-25b3-58c3-9588-7f6f872f6260",
+      "notes": "FR-K4. Pauses the run until the approval form calls the resume URL, or 2 hours pass. The run is saved while it waits, so n8n can even be restarted in between.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Rules still undecided when the wait ends count as rejected (their bad values become null)\nupdate ops.cleaning_rules set status = 'expired', decided_at = now() where status = 'pending';\nupdate ops.cleaning_approvals set status = 'expired'\nwhere run_id = '{{ $('Tables').first().json.run_id }}' and status = 'waiting';\nselect status from ops.cleaning_approvals where run_id = '{{ $('Tables').first().json.run_id }}';",
+        "options": {}
+      },
+      "id": "248753ea-1f15-5c9b-bad4-8152347530c1",
+      "name": "Expire undecided rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2200,
+        -100
+      ],
+      "notes": "Rules still pending when the wait ends become 'expired' and are treated as rejected. Marks the approval request as expired if nobody answered.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Start the apply phase with the same table list\nreturn $('Tables').all().map(item => ({ json: item.json }));"
+      },
+      "id": "dac9fc5c-10ed-58cf-aa74-e182ec381015",
+      "name": "Tables to apply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        40
+      ],
+      "executeOnce": true,
+      "notes": "Sends the table list from 'Tables' into the apply loop.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "0f48a6e3-81a6-5ed7-8f1b-e03741229751",
+      "name": "Apply each table",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2640,
+        40
+      ],
+      "notes": "Loop Over Items, one table at a time. 'loop' output = clean the next table; 'done' output = run the cross-table checks.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- The rules of the latest proposal for this table, with their decisions, in run order\nselect *\nfrom ops.cleaning_rules\nwhere source = '{{ $('Apply each table').first().json.source }}'\n  and status <> 'invalid'\n  and run_id = (select run_id from ops.cleaning_rules\n                where source = '{{ $('Apply each table').first().json.source }}'\n                order by created_at desc limit 1)\norder by rule_order;",
+        "options": {}
+      },
+      "id": "f5cbda43-6dcd-5856-adb7-384f0e7f0e17",
+      "name": "Get rules to apply",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2860,
+        200
+      ],
+      "alwaysOutputData": true,
+      "notes": "Reads this table's rules and their decisions from ops.cleaning_rules, in run order.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// One SQL script per table, run as one transaction: rebuild the working copy from raw, apply the rules\n// (auto and approved: the rule; rejected and expired: bad values become null), cast to the target types,\n// move rows with a missing or repeated key to ops.quarantine, and replace clean.<table>.\nconst t = $('Apply each table').first().json;\nconst rules = $input.all().map(i => i.json).filter(r => r.rule_id);\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nif (rules.length === 0) {\n  return [{ json: { sql: `select jsonb_build_object('skipped', true) as result;` } }];\n}\nconst S = `cleaning.${t.source}`;\nconst C = `clean.${t.source}`;\nconst cast = (c, type) => ({\n  text: `nullif(t.${c}, '')`,\n  integer: `cleaning.try_int(t.${c})`,\n  smallint: `cleaning.try_int(t.${c})::smallint`,\n  numeric: `round(cleaning.try_numeric(t.${c}), 2)`,\n  double: `cleaning.try_numeric(t.${c})::double precision`,\n  timestamp: `cleaning.try_timestamp(t.${c})`,\n})[type];\nconst cols = Object.entries(t.columns);\nconst typed = cols.filter(([, type]) => type !== 'text');\nconst keyMissing = t.key.length ? t.key.map(k => `y.${k} is null`).join(' or ') : 'false';\nconst keyRank = t.key.length\n  ? `row_number() over (partition by ${t.key.map(k => cast(k, t.columns[k])).join(', ')} order by t._row)`\n  : '1';\nconst ruleSql = rules.map(r =>\n  ['auto', 'approved'].includes(r.status) ? r.sql : ['rejected', 'expired'].includes(r.status) ? r.reject_sql : null);\n\nconst sql = [\n  `create temp table _run on commit drop as select ${lit(t.run_id)}::text as run_id, 'apply'::text as mode;`,\n  `create temp table _results (rule_id text, rows_affected integer, examples jsonb) on commit drop;`,\n  `delete from ops.quarantine where source = ${lit(t.source)};`,\n  t.stage_sql,\n  `create temp table _before on commit drop as select count(*)::int as n from ${S};`,\n  ...ruleSql.filter(Boolean),\n  `create temp table _typed on commit drop as select t._row, ` +\n    `${cols.map(([c, type]) => `${cast(c, type)} as ${c}`).join(', ')}, ${keyRank} as _key_rank from ${S} t;`,\n  typed.length\n    ? `create temp table _cast on commit drop as select jsonb_build_object(` +\n      `${typed.map(([c, type]) => `${lit(c)}, count(*) filter (where nullif(btrim(t.${c}), '') is not null and ${cast(c, type)} is null)`).join(', ')}` +\n      `) as failures from ${S} t;`\n    : `create temp table _cast on commit drop as select '{}'::jsonb as failures;`,\n  `insert into ops.quarantine (run_id, source, rule_id, reason, record) ` +\n    `select r.run_id, ${lit(t.source)}, null, case when ${keyMissing} then 'key missing after cleaning' ` +\n    `else 'duplicate key after cleaning; the first row was kept' end, to_jsonb(t) - '_row' ` +\n    `from _typed y join ${S} t on t._row = y._row cross join _run r where ${keyMissing} or y._key_rank > 1;`,\n  `truncate ${C};`,\n  `insert into ${C} (${cols.map(([c]) => c).join(', ')}) ` +\n    `select ${cols.map(([c]) => `y.${c}`).join(', ')} from _typed y where not (${keyMissing}) and y._key_rank = 1;`,\n  `select jsonb_build_object(` +\n    `'rows_before', (select n from _before), ` +\n    `'rows_after_rules', (select count(*) from ${S}), ` +\n    `'rows_written', (select count(*) from ${C}), ` +\n    `'quarantined', (select count(*) from ops.quarantine where source = ${lit(t.source)}), ` +\n    `'cast_failures', (select failures from _cast), ` +\n    `'rules', (select coalesce(jsonb_agg(r order by r.rule_id), '[]'::jsonb) from _results r)) as result;`,\n].join('\\n');\nreturn [{ json: { sql } }];"
+      },
+      "id": "60127445-6432-56ba-989e-0415b84fdae1",
+      "name": "Build cleaning SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        200
+      ],
+      "notes": "FR-K5. Builds one SQL script for the table: rebuild the working copy from raw, apply each rule (auto and approved: the rule; rejected and expired: the bad values become null), cast every column to its type (values that do not fit become null and are counted), move rows with a missing or repeated key to ops.quarantine, and replace clean.<table>.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- The cleaning script built in the previous node: one transaction, so clean.<table> is never half-written\n{{ $json.sql }}",
+        "options": {}
+      },
+      "id": "ee6b618d-fb51-54f0-9b1e-e7e421620125",
+      "name": "Run cleaning SQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3300,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Runs the script as one transaction: if anything fails, clean.<table> keeps its previous content. Continues on error, so one failing table does not stop the others.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log rows: one per rule (what it changed, and the decision behind it) and one for the table (before/after counts)\nconst t = $('Apply each table').first().json;\nconst rules = $('Get rules to apply').all().map(i => i.json).filter(r => r.rule_id);\nconst out = $input.first().json;\nconst base = { run_id: t.run_id, agent: 'cleaning', source: t.source, target_table: `clean.${t.source}`, duration_ms: null };\nif (out.error || !out.result) {\n  const error = out.message ?? out.error?.message ?? out.error ?? 'no result';\n  return [{ json: { ...base, action: 'clean_table', status: 'failed', rows_read: null, rows_written: null,\n    reason: `Cleaning ${t.source} failed, clean.${t.source} is unchanged: ${error}`, details: JSON.stringify({ error }) } }];\n}\nconst r = out.result;\nif (r.skipped) {\n  return [{ json: { ...base, action: 'clean_table', status: 'warning', rows_read: null, rows_written: null,\n    reason: `No usable rules for ${t.source}; clean.${t.source} is unchanged`, details: JSON.stringify({}) } }];\n}\nconst done = Object.fromEntries((r.rules ?? []).map(x => [x.rule_id, x]));\nconst ruleLogs = rules.map(rule => {\n  const result = done[rule.rule_id];\n  const applied = ['auto', 'approved'].includes(rule.status);\n  const what = `${rule.rule_type}${rule.column_name ? ` on ${rule.column_name}` : ''}`;\n  const n = result?.rows_affected ?? 0;\n  return { ...base, action: 'apply_rule', status: 'success', rows_read: null, rows_written: n,\n    reason: applied ? `${what} (${rule.status}): ${n} rows changed`\n      : result ? `${what} was ${rule.status}: ${n} bad values set to null` : `${what} was ${rule.status}: nothing changed`,\n    details: JSON.stringify({ rule_id: rule.rule_id, decision: rule.status, risk: rule.risk,\n                              decided_by: rule.decided_by ?? null, examples: result?.examples ?? [] }) };\n});\nconst castFailures = Object.values(r.cast_failures ?? {}).reduce((a, b) => a + b, 0);\nconst tableLog = { ...base, action: 'clean_table', status: 'success', rows_read: r.rows_before, rows_written: r.rows_written,\n  reason: `${r.rows_before} rows in, ${r.rows_written} rows written to clean.${t.source}: ` +\n          `${r.rows_before - r.rows_after_rules} removed by rules, ${r.quarantined} kept in ops.quarantine, ` +\n          `${castFailures} values could not be typed and became null`,\n  details: JSON.stringify({ rows_before: r.rows_before, rows_after_rules: r.rows_after_rules, rows_written: r.rows_written,\n                            quarantined: r.quarantined, cast_failures: r.cast_failures }) };\nreturn [...ruleLogs, tableLog].map(json => ({ json }));"
+      },
+      "id": "0d1f2472-1f7c-5a1e-a729-6412b760b819",
+      "name": "Cleaning log rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3520,
+        200
+      ],
+      "executeOnce": true,
+      "notes": "FR-K6. One ops.agent_logs row per rule (rows changed and the decision behind it) and one per table (rows before and after, quarantined rows, values that could not be typed).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "860e790d-b525-549a-a40e-cc05f8c3f184",
+      "name": "Log cleaning",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3740,
+        200
+      ],
+      "notes": "Writes the cleaning log rows, then goes back to 'Apply each table'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- After cleaning: do the clean tables fit together? (same checks as the collection stage, now on typed data)\nselect 'order_items → orders' as check_name, count(*)::int as mismatches\n  from clean.order_items i where not exists (select 1 from clean.orders o where o.order_id = i.order_id)\nunion all\nselect 'order_items → products', count(*)::int\n  from clean.order_items i where i.product_id is not null and not exists (select 1 from clean.products p where p.product_id = i.product_id)\nunion all\nselect 'order_items → sellers', count(*)::int\n  from clean.order_items i where not exists (select 1 from clean.sellers s where s.seller_id = i.seller_id)\nunion all\nselect 'orders → customers', count(*)::int\n  from clean.orders o where not exists (select 1 from clean.customers c where c.customer_id = o.customer_id)\nunion all\nselect 'payments → orders', count(*)::int\n  from clean.payments p where not exists (select 1 from clean.orders o where o.order_id = p.order_id)\nunion all\nselect 'reviews → orders', count(*)::int\n  from clean.reviews r where not exists (select 1 from clean.orders o where o.order_id = r.order_id)\nunion all\nselect 'products → category_translation', count(*)::int\n  from (select distinct product_category_name from clean.products where product_category_name is not null) p\n  where not exists (select 1 from clean.category_translation c where c.product_category_name = p.product_category_name)\nunion all\nselect 'customers → geolocation (zip prefixes)', count(*)::int\n  from (select distinct customer_zip_code_prefix z from clean.customers) c\n  where not exists (select 1 from clean.geolocation g where g.geolocation_zip_code_prefix = c.z);",
+        "options": {}
+      },
+      "id": "6a2a1719-92f4-59fa-93d9-f8be395fc696",
+      "name": "Check clean tables",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2860,
+        -120
+      ],
+      "executeOnce": true,
+      "notes": "Checks that the clean tables fit together: IDs with no match in the related table, categories with no translation, zip codes missing from geolocation.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const run = $('Tables').first().json;\nconst checks = $input.all().map(i => i.json);\nconst tables = $('Tables').all().length;\nreturn [{ json: {\n  run_id: run.run_id, agent: 'cleaning', action: 'run_complete', source: null, target_table: null,\n  status: 'success', rows_read: null, rows_written: null, duration_ms: null,\n  reason: `Cleaning finished for ${tables} tables. Cross-table checks: ` +\n          checks.map(c => `${c.check_name} ${c.mismatches}`).join('; '),\n  details: JSON.stringify({ checks }),\n} }];"
+      },
+      "id": "bfa8ea45-9f1e-582f-8cb5-ca1679779c16",
+      "name": "Run log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        -120
+      ],
+      "notes": "Builds the final ops.agent_logs row with the results of the cross-table checks.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "01e077a7-c1f7-5828-9d72-b4db61776617",
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3300,
+        -120
+      ],
+      "notes": "Writes the run's final row into ops.agent_logs (action 'run_complete').",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "content": "## Cleaning stage · how it works\n\n1. **Propose** (per table): copy raw → `cleaning.<table>`, profile every column in SQL, and ask the **Cleaning agent** for rules from a fixed list. *Check rules* validates them, sorts them into **safe** and **risky** (fixed policy, not the AI), turns them into SQL and dry-runs them to count rows. Tables that already have rules reuse them (no AI call).\n2. **Approve**: if any risky rule is undecided, the run logs the form link and **waits**. A person opens the *Cleaning · Approve rules* form; submitting it wakes this run up.\n3. **Apply** (per table): one SQL transaction rebuilds the working copy, applies the rules, types the columns and replaces `clean.<table>`.\n4. **Check**: cross-table checks and a final log row.\n\nEverything is logged in `ops.agent_logs`; every rule and decision is in `ops.cleaning_rules`.",
+        "height": 440,
+        "width": 1500,
+        "color": 5
+      },
+      "id": "6e65c310-86b6-5b39-9e23-63b6c9477bcb",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -620
+      ]
+    }
+  ],
+  "connections": {
+    "Run cleaning": {
+      "main": [
+        [
+          {
+            "node": "Tables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tables": {
+      "main": [
+        [
+          {
+            "node": "Each table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Each table": {
+      "main": [
+        [
+          {
+            "node": "Count pending rules",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get stored rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get stored rules": {
+      "main": [
+        [
+          {
+            "node": "Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide": {
+      "main": [
+        [
+          {
+            "node": "Rules needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rules needed?": {
+      "main": [
+        [
+          {
+            "node": "Build working copy",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reuse log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build working copy": {
+      "main": [
+        [
+          {
+            "node": "Profile columns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Profile columns": {
+      "main": [
+        [
+          {
+            "node": "Profile table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Profile table": {
+      "main": [
+        [
+          {
+            "node": "Get contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get contract": {
+      "main": [
+        [
+          {
+            "node": "Build rules prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build rules prompt": {
+      "main": [
+        [
+          {
+            "node": "Cleaning agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleaning agent": {
+      "main": [
+        [
+          {
+            "node": "Check rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check rules": {
+      "main": [
+        [
+          {
+            "node": "Dry run rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry run rules": {
+      "main": [
+        [
+          {
+            "node": "Rule rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rule rows": {
+      "main": [
+        [
+          {
+            "node": "Save rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save rules": {
+      "main": [
+        [
+          {
+            "node": "Proposal log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Proposal log row": {
+      "main": [
+        [
+          {
+            "node": "Log proposal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log proposal": {
+      "main": [
+        [
+          {
+            "node": "Each table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reuse log row": {
+      "main": [
+        [
+          {
+            "node": "Log reuse",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log reuse": {
+      "main": [
+        [
+          {
+            "node": "Each table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleaning model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Cleaning agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleaning output format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Cleaning agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count pending rules": {
+      "main": [
+        [
+          {
+            "node": "Needs approval?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs approval?": {
+      "main": [
+        [
+          {
+            "node": "Approval request row",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Tables to apply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval request row": {
+      "main": [
+        [
+          {
+            "node": "Save approval request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save approval request": {
+      "main": [
+        [
+          {
+            "node": "Waiting log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Waiting log row": {
+      "main": [
+        [
+          {
+            "node": "Log waiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log waiting": {
+      "main": [
+        [
+          {
+            "node": "Wait for approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for approval": {
+      "main": [
+        [
+          {
+            "node": "Expire undecided rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expire undecided rules": {
+      "main": [
+        [
+          {
+            "node": "Tables to apply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tables to apply": {
+      "main": [
+        [
+          {
+            "node": "Apply each table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply each table": {
+      "main": [
+        [
+          {
+            "node": "Check clean tables",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get rules to apply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get rules to apply": {
+      "main": [
+        [
+          {
+            "node": "Build cleaning SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build cleaning SQL": {
+      "main": [
+        [
+          {
+            "node": "Run cleaning SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run cleaning SQL": {
+      "main": [
+        [
+          {
+            "node": "Cleaning log rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleaning log rows": {
+      "main": [
+        [
+          {
+            "node": "Log cleaning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log cleaning": {
+      "main": [
+        [
+          {
+            "node": "Apply each table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check clean tables": {
+      "main": [
+        [
+          {
+            "node": "Run log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run log row": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

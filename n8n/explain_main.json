@@ -1,0 +1,953 @@
+{
+  "id": "olistExplMain01",
+  "name": "Explain · Main",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "bfbfe9b1-9a6f-5430-8788-62962fad5b20",
+      "name": "Run explain",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Start here: click 'Execute workflow' to explain the KPI months and publish the insights. Run transformation first, so analytics.* is filled.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// ==== Settings ===============================================================\nconst MONTHS = [];  // e.g. ['2018-03'] to explain a few months; empty = every month that moved\nconst KPIS = [];    // e.g. ['late_delivery_rate']; empty = every enabled KPI in insights.kpi_config\n// =============================================================================\n\nconst runId = 'explain_' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);\nreturn [{ json: { run_id: runId, months: MONTHS, kpis: KPIS, full: MONTHS.length === 0 } }];"
+      },
+      "id": "60ef342c-4313-5156-9fb4-c30c69783b83",
+      "name": "Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "MONTHS limits the run to a few months (e.g. ['2018-03']); empty = every month that moved, and months that no longer move are removed from the dashboard. KPIS limits the KPIs (empty = every enabled row in insights.kpi_config). Also makes the run id.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Rebuild analytics.order_facts from the latest analytics tables, and clear rows left by a run that stopped\ntruncate insights.stage_summary, insights.stage_causes, insights.stage_recommendations;\nselect insights.refresh_order_facts() as order_facts_rows;",
+        "options": {}
+      },
+      "id": "62aedeac-90ce-5d81-b6fc-33ab49afad8b",
+      "name": "Refresh order facts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Rebuilds analytics.order_facts (one row per order with the columns a cause can use) from the latest analytics tables, and clears staging rows of a run that stopped.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Every month in which an enabled KPI moved against its baseline (insights.kpi_months), limited by the settings\nselect k.kpi_id, k.name, k.definition, k.gap_noun, k.columns, k.levers, k.impact,\n       to_char(m.month, 'YYYY-MM-DD') as month, m.orders, m.prev_orders, m.counted, m.gap_orders,\n       m.rate, m.baseline_rate, m.ratio\nfrom insights.kpi_config k cross join lateral insights.kpi_months(k.kpi_id) m\nwhere k.enabled and m.moved\n  and (jsonb_array_length('{{ JSON.stringify($('Settings').first().json.kpis) }}'::jsonb) = 0\n       or '{{ JSON.stringify($('Settings').first().json.kpis) }}'::jsonb ? k.kpi_id)\n  and (jsonb_array_length('{{ JSON.stringify($('Settings').first().json.months) }}'::jsonb) = 0\n       or '{{ JSON.stringify($('Settings').first().json.months) }}'::jsonb ? to_char(m.month, 'YYYY-MM'))\norder by k.kpi_id, m.month;",
+        "options": {}
+      },
+      "id": "2fef56ba-0ceb-5461-9651-e5cf55e536fd",
+      "name": "Find moved months",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        300
+      ],
+      "executeOnce": true,
+      "notes": "insights.kpi_months for every enabled KPI: a month moved when its rate is at least threshold_ratio times its baseline (median of the 3 months before) and min_rise above it. One item per KPI and month. No AI.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "ad880bde-9360-5ff2-ac4c-968d568c219e",
+      "name": "Each month",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Loop Over Items, one KPI month at a time. 'loop' output = explain the next month; 'done' output = publish everything.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- The KPI broken down by every approved column and pair (top rows of each, largest excess first)\nselect insights.breakdowns('{{ $json.kpi_id }}', '{{ $json.month }}'::date) as cuts;",
+        "options": {}
+      },
+      "id": "6a5d90a2-f26e-5edc-a251-74a9b817a1a7",
+      "name": "Run breakdowns",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        460
+      ],
+      "notes": "insights.breakdowns: the KPI this month broken down by every approved column and pair, against the same orders in a normal month. Top rows of each, largest rise first.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// The month against its baseline and the breakdown totals. No raw orders are sent.\nconst m = $('Each month').first().json;\nconst cuts = $input.first().json.cuts;\nconst pct = v => v == null ? 'n/a' : (100 * Number(v)).toFixed(1) + '%';\nconst label = new Date(m.month + 'T00:00:00Z').toLocaleString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' });\nconst show = value => Object.entries(value).map(([c, v]) => `${c}=${v ?? 'null'}`).join(', ');\nconst lines = [\n  `KPI: ${m.name} (${m.kpi_id}). ${m.definition}`,\n  `Gap orders: ${m.gap_noun}. Cross-KPI effect measured for each cause: ${m.impact?.noun ?? 'none'}.`,\n  `Month: ${label}. ${m.name}: ${pct(m.rate)}, against ${pct(m.baseline_rate)} in a normal month ` +\n    `(median of the 3 months before), ${m.ratio} times as high.`,\n  `Orders: ${m.orders}, against ${m.prev_orders ?? 'n/a'} the month before. ${m.counted} orders count for the KPI, ` +\n    `${m.gap_orders} of them ${m.gap_noun}: about ${Math.round(m.counted * (m.rate - m.baseline_rate))} more than at ` +\n    'the normal rate.',\n  '',\n  `Approved columns: ${m.columns.join(', ')}`,\n  'Levers:',\n  ...Object.entries(m.levers).map(([k, v]) => `- ${k}: ${v}`),\n  '',\n  'Breakdowns. Each row: value | orders | gap orders and rate this month | rate of the same orders in a normal month | ' +\n    'share of the month\\'s gap orders | gap orders above normal:',\n];\n// Single columns in the order of the KPI settings, then the pairs\nconst order = name => { const i = m.columns.indexOf(name); return i < 0 ? m.columns.length : i; };\nfor (const [name, rows] of Object.entries(cuts).sort(([a], [b]) => order(a) - order(b))) {\n  lines.push('', `[${name}]`);\n  for (const r of rows) {\n    lines.push(`- ${show(r.value)} | ${r.orders} | ${r.gap_orders} = ${pct(r.rate)} | normal ${pct(r.baseline_rate)} | ` +\n               `${pct(r.share_of_gap)} of ${m.gap_noun} | ${r.excess_gap_orders > 0 ? '+' : ''}${r.excess_gap_orders}`);\n  }\n}\nreturn [{ json: { prompt: lines.join('\\n') } }];"
+      },
+      "id": "57cc6ed6-cdf2-594f-9353-41413e77d551",
+      "name": "Build prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        460
+      ],
+      "notes": "The KPI, the month against its baseline, order volume, the approved columns, the levers and every breakdown as compact lines. No single orders are sent.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are the Explain agent in the data pipeline of an online marketplace (Olist, Brazil). A KPI moved\nin one month. You get the KPI, the month against a normal month, and the KPI broken down by approved columns. You\nexplain why it moved and what to do about it. You never see single orders and you never run SQL: the system measures\nevery cause you name with a fixed query, and fills in every number.\n\nHow to read a breakdown row: the value; its orders; its gap orders and rate this month; the rate of the same orders in\na normal month; its share of the month's gap orders; and how many gap orders it has above normal. Orders above normal\nare what explain the rise. A value with a large share but nothing above normal was always like that and does not\nexplain this month.\n\nReturn:\n- what_happened: one or two sentences: the KPI this month against a normal month, and what order volume did.\n- ruled_out: the explanations a reader would expect that the breakdowns rule out (for example order volume, or\n  sellers handing parcels over late), each with the reason and the breakdowns that show it (none for order volume,\n  which is in the month line). Only factors the data really rules out; may be empty.\n- causes: one to four causes. Each is a filter on approved columns that selects the orders behind the rise: one to\n  three conditions, op \"=\" or \"!=\" with one value, or \"in\" with several, using values exactly as they appear in the\n  breakdowns. Prefer the filter that covers the most orders above normal with the fewest conditions; a pair breakdown\n  often shows it best. Causes may overlap but must not repeat each other. cause_name: short and plain.\n  explanation: one to three sentences on what went wrong for these orders. supporting_cuts: the names of the\n  breakdowns (as in the square brackets) that show it.\n- recommendations: one or two per cause. lever: one key from the lever list. action: one concrete next step that names\n  the exact segment (states, routes, categories, sellers) the cause covers. closes_cause_keys: the causes it fixes.\n  Never recommend acting on something you ruled out.\n\nRules for all text:\n- No digits at all. Every number is a placeholder that the system fills in:\n  in any text: {month} {month_rate} {month_baseline_rate} {orders} {prev_orders} {orders_change}\n  in a cause's explanation also: {rate} {baseline_rate} {matched_orders} {gap_orders} {share_of_gap}\n    {excess_gap_orders} {points_recovered} {impact_recovered}\n  in a recommendation's action also: {points_recovered} (the largest of the causes it closes)\n  Write the month as {month}. Rates and shares come with their % sign; {points_recovered} is a number of points;\n  {impact_recovered} is in the cross-KPI unit given (e.g. review stars). {orders_change} has its sign (+8%), so\n  write \"orders changed by {orders_change}\", not \"grew {orders_change}\".\n- Never write a seller id in text (it has digits); the filter carries it. Say \"a few sellers\" or name their state.\n- Plain words for a business reader: say \"than in a normal month\", not \"baseline\" or \"excess\".\n- Say what the breakdowns show. You may name the likely mechanism they point to (for example carrier capacity on\n  certain routes), but do not invent facts that are not in the data.\n- Keys are lower_snake_case."
+        }
+      },
+      "id": "d19248b6-60d5-5102-8a13-b0fcb1c9723d",
+      "name": "Explain agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1540,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "AI agent. Returns what happened, what the data rules out, the causes (each a filter on approved columns) and one or two actions per cause, with placeholders instead of numbers. It cannot run anything. Continues on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "maxOutputTokens": 16384,
+          "temperature": 0
+        }
+      },
+      "id": "06eec592-244c-5432-b5f0-2004912b0536",
+      "name": "Explain model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        520
+      ],
+      "notes": "The LLM the Explain agent uses (Gemini 2.5 Flash, temperature 0). Needs the Gemini credential, like the other agents.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"what_happened\": {\n      \"type\": \"string\"\n    },\n    \"ruled_out\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"factor\": {\n            \"type\": \"string\"\n          },\n          \"reason\": {\n            \"type\": \"string\"\n          },\n          \"supporting_cuts\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          }\n        },\n        \"required\": [\n          \"factor\",\n          \"reason\",\n          \"supporting_cuts\"\n        ]\n      }\n    },\n    \"causes\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"cause_key\": {\n            \"type\": \"string\"\n          },\n          \"cause_name\": {\n            \"type\": \"string\"\n          },\n          \"cause_filter\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"object\",\n              \"properties\": {\n                \"column\": {\n                  \"type\": \"string\"\n                },\n                \"op\": {\n                  \"type\": \"string\",\n                  \"enum\": [\n                    \"=\",\n                    \"!=\",\n                    \"in\"\n                  ]\n                },\n                \"values\": {\n                  \"type\": \"array\",\n                  \"items\": {\n                    \"type\": \"string\"\n                  }\n                }\n              },\n              \"required\": [\n                \"column\",\n                \"op\",\n                \"values\"\n              ]\n            }\n          },\n          \"supporting_cuts\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          },\n          \"explanation\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"cause_key\",\n          \"cause_name\",\n          \"cause_filter\",\n          \"supporting_cuts\",\n          \"explanation\"\n        ]\n      }\n    },\n    \"recommendations\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"reco_key\": {\n            \"type\": \"string\"\n          },\n          \"lever\": {\n            \"type\": \"string\"\n          },\n          \"action\": {\n            \"type\": \"string\"\n          },\n          \"closes_cause_keys\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          }\n        },\n        \"required\": [\n          \"reco_key\",\n          \"lever\",\n          \"action\",\n          \"closes_cause_keys\"\n        ]\n      }\n    }\n  },\n  \"required\": [\n    \"what_happened\",\n    \"ruled_out\",\n    \"causes\",\n    \"recommendations\"\n  ]\n}"
+      },
+      "id": "4d75ca5d-32a8-51bd-ae9c-b798113f110e",
+      "name": "Explain output format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        1680,
+        520
+      ],
+      "notes": "Structured Output Parser with a fixed JSON schema: what_happened, ruled_out, causes (cause_filter with column / op / values), recommendations.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Checks without AI, item by item, then builds the query that measures every cause that is well formed.\n// An item that fails can be repaired once; the rest of the answer is kept.\nconst m = $('Each month').first().json;\nconst cuts = $('Run breakdowns').first().json.cuts;\nconst out = $input.first().json;\n// n8n's Postgres node fills {{ }} with String.replace, which reads $' $& $` $$ in the value as patterns, so a\n// literal never contains a $: it is written as chr(36), which gives the same text.\nconst lit = v => { const s = String(v).replace(/'/g, \"''\");\n                   return s.includes('$') ? `(${s.split('$').map(p => `'${p}'`).join(' || chr(36) || ')})` : `'${s}'`; };\nconst MONTH_KEYS = ['month', 'month_rate', 'month_baseline_rate', 'orders', 'prev_orders', 'orders_change'];\nconst CAUSE_KEYS = [...MONTH_KEYS, 'rate', 'baseline_rate', 'matched_orders', 'gap_orders', 'share_of_gap',\n                    'excess_gap_orders', 'points_recovered', 'impact_recovered'];\nconst RECO_KEYS = [...MONTH_KEYS, 'points_recovered'];\nconst KEY = /^[a-z][a-z0-9_]{2,59}$/;\nconst cutNames = Object.keys(cuts);\n\nfunction textProblems(text, allowed) {\n  const s = String(text ?? '').trim();\n  if (!s) return ['the text is empty'];\n  const problems = [];\n  const bare = s.replace(/\\{[a-z_]+\\}/g, '');\n  if (/\\d/.test(bare)) problems.push('the text has a number in it; use a placeholder');\n  const unknown = [...s.matchAll(/\\{([a-z_]+)\\}/g)].map(x => x[1]).filter(k => !allowed.includes(k));\n  if (unknown.length) problems.push(`placeholders not allowed here: ${unknown.map(k => `{${k}}`).join(', ')}`);\n  if (/[{}]/.test(bare)) problems.push('the text has a { or } that is not a placeholder');\n  return problems;\n}\nconst cutProblems = list => !Array.isArray(list) || list.length === 0 ? ['name at least one breakdown in supporting_cuts']\n  : list.filter(c => !cutNames.includes(c)).map(c => `\"${c}\" is not a breakdown`);\n\nconst errors = [];  // { item, key, problems }\nconst answer = out.output ?? null;\nif (!answer) {\n  errors.push({ item: 'answer', key: 'answer', problems: [\n    out.error ? `the agent failed: ${out.error.message ?? out.error}` : 'no answer was returned'] });\n}\nconst a = answer ?? { what_happened: '', ruled_out: [], causes: [], recommendations: [] };\n\nconst p = textProblems(a.what_happened, MONTH_KEYS);\nif (answer && p.length) errors.push({ item: 'what_happened', key: 'what_happened', problems: p });\n\n(a.ruled_out ?? []).forEach((r, i) => {\n  const cutsNamed = r.supporting_cuts ?? [];\n  const problems = [...textProblems(r.factor, []), ...textProblems(r.reason, MONTH_KEYS),\n                    ...(cutsNamed.length ? cutProblems(cutsNamed) : [])];\n  if (problems.length) errors.push({ item: 'ruled_out', key: r.factor || `ruled_out_${i + 1}`, problems });\n});\n\nconst causes = (a.causes ?? []).map(c => ({ ...c,\n  filter: (c.cause_filter ?? []).map(f => ({ column: f.column, op: f.op,\n                                             value: f.op === 'in' ? (f.values ?? []) : (f.values ?? [])[0] })) }));\nif (answer && causes.length === 0) errors.push({ item: 'causes', key: 'causes', problems: ['name at least one cause'] });\nconst seen = new Set();\nfor (const c of causes) {\n  const problems = [];\n  if (!KEY.test(c.cause_key ?? '')) problems.push('cause_key must be lower_snake_case');\n  if (seen.has(c.cause_key)) problems.push('cause_key is used twice');\n  seen.add(c.cause_key);\n  problems.push(...textProblems(c.cause_name, []).map(x => `cause_name: ${x}`),\n                ...textProblems(c.explanation, CAUSE_KEYS).map(x => `explanation: ${x}`),\n                ...cutProblems(c.supporting_cuts));\n  const raw = c.cause_filter ?? [];\n  if (raw.length < 1 || raw.length > 3) problems.push('the filter needs one to three conditions');\n  for (const f of raw) {\n    if (!m.columns.includes(f.column)) problems.push(`column \"${f.column}\" is not approved; allowed: ${m.columns.join(', ')}`);\n    const n = (f.values ?? []).length;\n    if (f.op === 'in' ? n < 1 : n !== 1) problems.push(`column \"${f.column}\": op ${f.op} needs ${f.op === 'in' ? 'one or more values' : 'exactly one value'}`);\n  }\n  if (problems.length) errors.push({ item: 'cause', key: c.cause_key, problems });\n}\n\nconst levers = Object.keys(m.levers);\nconst causeKeys = new Set(causes.map(c => c.cause_key));\nconst recoSeen = new Set();\nfor (const r of a.recommendations ?? []) {\n  const problems = [];\n  if (!KEY.test(r.reco_key ?? '')) problems.push('reco_key must be lower_snake_case');\n  if (recoSeen.has(r.reco_key)) problems.push('reco_key is used twice');\n  recoSeen.add(r.reco_key);\n  if (!levers.includes(r.lever)) problems.push(`lever \"${r.lever}\" is not in the list: ${levers.join(', ')}`);\n  problems.push(...textProblems(r.action, RECO_KEYS).map(x => `action: ${x}`));\n  const closes = r.closes_cause_keys ?? [];\n  if (closes.length === 0) problems.push('closes_cause_keys is empty');\n  const unknown = closes.filter(k => !causeKeys.has(k));\n  if (unknown.length) problems.push(`closes causes that do not exist: ${unknown.join(', ')}`);\n  if (problems.length) errors.push({ item: 'recommendation', key: r.reco_key, problems });\n}\n\n// Measure every cause whose filter is well formed, plus the whole month (empty filter) to reconcile with kpi_months\nconst failedCauses = new Set(errors.filter(e => e.item === 'cause').map(e => e.key));\nconst toSize = causes.filter(c => !failedCauses.has(c.cause_key));\nconst values = [`('__all__', '[]')`, ...toSize.map(c => `(${lit(c.cause_key)}, ${lit(JSON.stringify(c.filter))})`)];\nconst sizing_sql = `select v.k as key, insights.size_cause(${lit(m.kpi_id)}, ${lit(m.month)}::date, v.f::jsonb) as s\\n` +\n                   `from (values ${values.join(', ')}) v(k, f);`;\nreturn [{ json: { origin: 'agent', attempt: 1,\n                  answer: { ...a, causes }, errors, sizing_sql } }];"
+      },
+      "id": "0d858d27-8ac7-59da-abb0-35e6d3ad632e",
+      "name": "Check answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1880,
+        460
+      ],
+      "notes": "Checks without AI, item by item: no digits in any text, only allowed placeholders, keys in lower_snake_case, one to three conditions on approved columns, breakdown names that exist, levers from the list, actions that close existing causes. Builds the sizing query for every well-formed cause.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Measures each cause with insights.size_cause: the only place numbers come from\n{{ $json.sizing_sql }}",
+        "options": {}
+      },
+      "id": "1cd347b9-9a95-5ce0-9753-cd82d849a55f",
+      "name": "Size causes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2100,
+        460
+      ],
+      "notes": "insights.size_cause for every cause, plus the whole month: orders matched, late orders, rate against a normal month, share of late orders, points of late rate recovered and review stars recovered. Filters become SQL only inside the database, on approved columns, with every value quoted.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Adds the measured numbers and the checks that need them. A cause must match gap orders and have more of them than\n// in a normal month. The whole month must reconcile with kpi_months; if not, the data changed under the run (a system\n// error, never sent to the agent).\nconst m = $('Each month').first().json;\nconst c = $('Check answer').first().json;\nconst size = {};\nfor (const row of $input.all().map(i => i.json)) size[row.key] = typeof row.s === 'string' ? JSON.parse(row.s) : row.s;\nconst all = size.__all__;\nconst system_errors = [];\nif (!all?.ok) system_errors.push(`the month could not be measured: ${all?.error ?? 'no result'}`);\nelse if (all.gap_orders !== m.gap_orders || all.matched_orders !== m.counted)\n  system_errors.push(`sizing does not reconcile with kpi_months: ${all.matched_orders} orders / ${all.gap_orders} ` +\n                     `${m.gap_noun}, expected ${m.counted} / ${m.gap_orders}`);\n\nconst errors = [...c.errors];\nconst failed = new Set(errors.filter(e => e.item === 'cause').map(e => e.key));\nfor (const cause of c.answer.causes) {\n  if (failed.has(cause.cause_key)) continue;\n  const s = size[cause.cause_key];\n  const problems = [];\n  if (!s?.ok) problems.push(s?.error ?? 'it could not be measured');\n  else if (s.gap_orders === 0) problems.push(`the filter matches no ${m.gap_noun} this month`);\n  else if (s.excess_gap_orders <= 0) problems.push(`these orders were not ${m.gap_noun.replace(/ orders$/, '')} more often ` +\n                                                   'than in a normal month, so they do not explain the rise');\n  if (problems.length) { errors.push({ item: 'cause', key: cause.cause_key, problems }); failed.add(cause.cause_key); }\n}\nfor (const r of c.answer.recommendations ?? []) {\n  const lost = (r.closes_cause_keys ?? []).filter(k => failed.has(k));\n  if (lost.length && !errors.some(e => e.item === 'recommendation' && e.key === r.reco_key))\n    errors.push({ item: 'recommendation', key: r.reco_key, problems: [`closes a cause that was rejected: ${lost.join(', ')}`] });\n}\nreturn [{ json: { ...c, size, errors, system_errors, reconciled: system_errors.length === 0,\n                  passed: system_errors.length === 0 && errors.length === 0 } }];"
+      },
+      "id": "f8f6f541-4f25-52d4-852e-81c82c1e423a",
+      "name": "Read checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        460
+      ],
+      "notes": "Adds the measurements and the checks that need them: a cause must match late orders and have more of them than in a normal month. Reconciles the whole month with kpi_months.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.reconciled }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d4044284-5745-56c6-9265-2a59d0377897",
+      "name": "Reconciled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2540,
+        460
+      ],
+      "notes": "true → go on. false → the data or the KPI settings changed under the run: log it and stop. Never sent to the agent.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.passed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2cd57d4d-57bc-5871-b06d-0ce4231c28d8",
+      "name": "Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2760,
+        460
+      ],
+      "notes": "true → build the rows. false → give the agent one try to fix the rejected items.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// One second chance: the agent sees its answer and exactly which items were rejected, and why\nconst r = $('Read checks').first().json;\nconst prompt = [\n  $('Build prompt').first().json.prompt,\n  '',\n  'Your previous answer:',\n  JSON.stringify($('Explain agent').first().json.output ?? null),\n  '',\n  'These items were rejected:',\n  ...r.errors.map(e => `- ${e.item} \"${e.key}\": ${e.problems.join('; ')}`),\n  '',\n  'Return the whole answer again. Fix the rejected items, or leave them out if the data does not support them. ' +\n    'Keep every other item exactly as it was.',\n].join('\\n');\nreturn [{ json: { prompt } }];"
+      },
+      "id": "39362c2f-a285-5236-8656-a9a53fec3b13",
+      "name": "Repair prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        900
+      ],
+      "notes": "The original prompt, the agent's answer and every rejected item with the reasons. The agent fixes those items or leaves them out, and keeps the rest.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are the Explain agent in the data pipeline of an online marketplace (Olist, Brazil). A KPI moved\nin one month. You get the KPI, the month against a normal month, and the KPI broken down by approved columns. You\nexplain why it moved and what to do about it. You never see single orders and you never run SQL: the system measures\nevery cause you name with a fixed query, and fills in every number.\n\nHow to read a breakdown row: the value; its orders; its gap orders and rate this month; the rate of the same orders in\na normal month; its share of the month's gap orders; and how many gap orders it has above normal. Orders above normal\nare what explain the rise. A value with a large share but nothing above normal was always like that and does not\nexplain this month.\n\nReturn:\n- what_happened: one or two sentences: the KPI this month against a normal month, and what order volume did.\n- ruled_out: the explanations a reader would expect that the breakdowns rule out (for example order volume, or\n  sellers handing parcels over late), each with the reason and the breakdowns that show it (none for order volume,\n  which is in the month line). Only factors the data really rules out; may be empty.\n- causes: one to four causes. Each is a filter on approved columns that selects the orders behind the rise: one to\n  three conditions, op \"=\" or \"!=\" with one value, or \"in\" with several, using values exactly as they appear in the\n  breakdowns. Prefer the filter that covers the most orders above normal with the fewest conditions; a pair breakdown\n  often shows it best. Causes may overlap but must not repeat each other. cause_name: short and plain.\n  explanation: one to three sentences on what went wrong for these orders. supporting_cuts: the names of the\n  breakdowns (as in the square brackets) that show it.\n- recommendations: one or two per cause. lever: one key from the lever list. action: one concrete next step that names\n  the exact segment (states, routes, categories, sellers) the cause covers. closes_cause_keys: the causes it fixes.\n  Never recommend acting on something you ruled out.\n\nRules for all text:\n- No digits at all. Every number is a placeholder that the system fills in:\n  in any text: {month} {month_rate} {month_baseline_rate} {orders} {prev_orders} {orders_change}\n  in a cause's explanation also: {rate} {baseline_rate} {matched_orders} {gap_orders} {share_of_gap}\n    {excess_gap_orders} {points_recovered} {impact_recovered}\n  in a recommendation's action also: {points_recovered} (the largest of the causes it closes)\n  Write the month as {month}. Rates and shares come with their % sign; {points_recovered} is a number of points;\n  {impact_recovered} is in the cross-KPI unit given (e.g. review stars). {orders_change} has its sign (+8%), so\n  write \"orders changed by {orders_change}\", not \"grew {orders_change}\".\n- Never write a seller id in text (it has digits); the filter carries it. Say \"a few sellers\" or name their state.\n- Plain words for a business reader: say \"than in a normal month\", not \"baseline\" or \"excess\".\n- Say what the breakdowns show. You may name the likely mechanism they point to (for example carrier capacity on\n  certain routes), but do not invent facts that are not in the data.\n- Keys are lower_snake_case."
+        }
+      },
+      "id": "42e8a037-1d42-569a-b974-492879d5c9ce",
+      "name": "Repair agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1540,
+        900
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput",
+      "notes": "The same agent and instructions, asked once to fix the rejected items. Continues on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "maxOutputTokens": 16384,
+          "temperature": 0
+        }
+      },
+      "id": "19024154-1557-5b24-940f-7fc054a4729b",
+      "name": "Repair model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        1120
+      ],
+      "notes": "Same LLM as the Explain model. Needs the Gemini credential.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"what_happened\": {\n      \"type\": \"string\"\n    },\n    \"ruled_out\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"factor\": {\n            \"type\": \"string\"\n          },\n          \"reason\": {\n            \"type\": \"string\"\n          },\n          \"supporting_cuts\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          }\n        },\n        \"required\": [\n          \"factor\",\n          \"reason\",\n          \"supporting_cuts\"\n        ]\n      }\n    },\n    \"causes\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"cause_key\": {\n            \"type\": \"string\"\n          },\n          \"cause_name\": {\n            \"type\": \"string\"\n          },\n          \"cause_filter\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"object\",\n              \"properties\": {\n                \"column\": {\n                  \"type\": \"string\"\n                },\n                \"op\": {\n                  \"type\": \"string\",\n                  \"enum\": [\n                    \"=\",\n                    \"!=\",\n                    \"in\"\n                  ]\n                },\n                \"values\": {\n                  \"type\": \"array\",\n                  \"items\": {\n                    \"type\": \"string\"\n                  }\n                }\n              },\n              \"required\": [\n                \"column\",\n                \"op\",\n                \"values\"\n              ]\n            }\n          },\n          \"supporting_cuts\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          },\n          \"explanation\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"cause_key\",\n          \"cause_name\",\n          \"cause_filter\",\n          \"supporting_cuts\",\n          \"explanation\"\n        ]\n      }\n    },\n    \"recommendations\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"reco_key\": {\n            \"type\": \"string\"\n          },\n          \"lever\": {\n            \"type\": \"string\"\n          },\n          \"action\": {\n            \"type\": \"string\"\n          },\n          \"closes_cause_keys\": {\n            \"type\": \"array\",\n            \"items\": {\n              \"type\": \"string\"\n            }\n          }\n        },\n        \"required\": [\n          \"reco_key\",\n          \"lever\",\n          \"action\",\n          \"closes_cause_keys\"\n        ]\n      }\n    }\n  },\n  \"required\": [\n    \"what_happened\",\n    \"ruled_out\",\n    \"causes\",\n    \"recommendations\"\n  ]\n}"
+      },
+      "id": "cc4a4b75-3617-5604-9228-1b4ea81a2801",
+      "name": "Repair output format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        1680,
+        1120
+      ],
+      "notes": "Same JSON schema as the Explain output format.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Checks without AI, item by item, then builds the query that measures every cause that is well formed.\n// An item that fails can be repaired once; the rest of the answer is kept.\nconst m = $('Each month').first().json;\nconst cuts = $('Run breakdowns').first().json.cuts;\nconst out = $input.first().json;\n// n8n's Postgres node fills {{ }} with String.replace, which reads $' $& $` $$ in the value as patterns, so a\n// literal never contains a $: it is written as chr(36), which gives the same text.\nconst lit = v => { const s = String(v).replace(/'/g, \"''\");\n                   return s.includes('$') ? `(${s.split('$').map(p => `'${p}'`).join(' || chr(36) || ')})` : `'${s}'`; };\nconst MONTH_KEYS = ['month', 'month_rate', 'month_baseline_rate', 'orders', 'prev_orders', 'orders_change'];\nconst CAUSE_KEYS = [...MONTH_KEYS, 'rate', 'baseline_rate', 'matched_orders', 'gap_orders', 'share_of_gap',\n                    'excess_gap_orders', 'points_recovered', 'impact_recovered'];\nconst RECO_KEYS = [...MONTH_KEYS, 'points_recovered'];\nconst KEY = /^[a-z][a-z0-9_]{2,59}$/;\nconst cutNames = Object.keys(cuts);\n\nfunction textProblems(text, allowed) {\n  const s = String(text ?? '').trim();\n  if (!s) return ['the text is empty'];\n  const problems = [];\n  const bare = s.replace(/\\{[a-z_]+\\}/g, '');\n  if (/\\d/.test(bare)) problems.push('the text has a number in it; use a placeholder');\n  const unknown = [...s.matchAll(/\\{([a-z_]+)\\}/g)].map(x => x[1]).filter(k => !allowed.includes(k));\n  if (unknown.length) problems.push(`placeholders not allowed here: ${unknown.map(k => `{${k}}`).join(', ')}`);\n  if (/[{}]/.test(bare)) problems.push('the text has a { or } that is not a placeholder');\n  return problems;\n}\nconst cutProblems = list => !Array.isArray(list) || list.length === 0 ? ['name at least one breakdown in supporting_cuts']\n  : list.filter(c => !cutNames.includes(c)).map(c => `\"${c}\" is not a breakdown`);\n\nconst errors = [];  // { item, key, problems }\nconst answer = out.output ?? null;\nif (!answer) {\n  errors.push({ item: 'answer', key: 'answer', problems: [\n    out.error ? `the agent failed: ${out.error.message ?? out.error}` : 'no answer was returned'] });\n}\nconst a = answer ?? { what_happened: '', ruled_out: [], causes: [], recommendations: [] };\n\nconst p = textProblems(a.what_happened, MONTH_KEYS);\nif (answer && p.length) errors.push({ item: 'what_happened', key: 'what_happened', problems: p });\n\n(a.ruled_out ?? []).forEach((r, i) => {\n  const cutsNamed = r.supporting_cuts ?? [];\n  const problems = [...textProblems(r.factor, []), ...textProblems(r.reason, MONTH_KEYS),\n                    ...(cutsNamed.length ? cutProblems(cutsNamed) : [])];\n  if (problems.length) errors.push({ item: 'ruled_out', key: r.factor || `ruled_out_${i + 1}`, problems });\n});\n\nconst causes = (a.causes ?? []).map(c => ({ ...c,\n  filter: (c.cause_filter ?? []).map(f => ({ column: f.column, op: f.op,\n                                             value: f.op === 'in' ? (f.values ?? []) : (f.values ?? [])[0] })) }));\nif (answer && causes.length === 0) errors.push({ item: 'causes', key: 'causes', problems: ['name at least one cause'] });\nconst seen = new Set();\nfor (const c of causes) {\n  const problems = [];\n  if (!KEY.test(c.cause_key ?? '')) problems.push('cause_key must be lower_snake_case');\n  if (seen.has(c.cause_key)) problems.push('cause_key is used twice');\n  seen.add(c.cause_key);\n  problems.push(...textProblems(c.cause_name, []).map(x => `cause_name: ${x}`),\n                ...textProblems(c.explanation, CAUSE_KEYS).map(x => `explanation: ${x}`),\n                ...cutProblems(c.supporting_cuts));\n  const raw = c.cause_filter ?? [];\n  if (raw.length < 1 || raw.length > 3) problems.push('the filter needs one to three conditions');\n  for (const f of raw) {\n    if (!m.columns.includes(f.column)) problems.push(`column \"${f.column}\" is not approved; allowed: ${m.columns.join(', ')}`);\n    const n = (f.values ?? []).length;\n    if (f.op === 'in' ? n < 1 : n !== 1) problems.push(`column \"${f.column}\": op ${f.op} needs ${f.op === 'in' ? 'one or more values' : 'exactly one value'}`);\n  }\n  if (problems.length) errors.push({ item: 'cause', key: c.cause_key, problems });\n}\n\nconst levers = Object.keys(m.levers);\nconst causeKeys = new Set(causes.map(c => c.cause_key));\nconst recoSeen = new Set();\nfor (const r of a.recommendations ?? []) {\n  const problems = [];\n  if (!KEY.test(r.reco_key ?? '')) problems.push('reco_key must be lower_snake_case');\n  if (recoSeen.has(r.reco_key)) problems.push('reco_key is used twice');\n  recoSeen.add(r.reco_key);\n  if (!levers.includes(r.lever)) problems.push(`lever \"${r.lever}\" is not in the list: ${levers.join(', ')}`);\n  problems.push(...textProblems(r.action, RECO_KEYS).map(x => `action: ${x}`));\n  const closes = r.closes_cause_keys ?? [];\n  if (closes.length === 0) problems.push('closes_cause_keys is empty');\n  const unknown = closes.filter(k => !causeKeys.has(k));\n  if (unknown.length) problems.push(`closes causes that do not exist: ${unknown.join(', ')}`);\n  if (problems.length) errors.push({ item: 'recommendation', key: r.reco_key, problems });\n}\n\n// Measure every cause whose filter is well formed, plus the whole month (empty filter) to reconcile with kpi_months\nconst failedCauses = new Set(errors.filter(e => e.item === 'cause').map(e => e.key));\nconst toSize = causes.filter(c => !failedCauses.has(c.cause_key));\nconst values = [`('__all__', '[]')`, ...toSize.map(c => `(${lit(c.cause_key)}, ${lit(JSON.stringify(c.filter))})`)];\nconst sizing_sql = `select v.k as key, insights.size_cause(${lit(m.kpi_id)}, ${lit(m.month)}::date, v.f::jsonb) as s\\n` +\n                   `from (values ${values.join(', ')}) v(k, f);`;\nreturn [{ json: { origin: 'repair', attempt: 2,\n                  answer: { ...a, causes }, errors, sizing_sql } }];"
+      },
+      "id": "517ec819-10bd-532b-b705-ac40aea371d2",
+      "name": "Check repaired answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1880,
+        900
+      ],
+      "notes": "The same checks as 'Check answer', for the repaired answer.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Measures each cause with insights.size_cause: the only place numbers come from\n{{ $json.sizing_sql }}",
+        "options": {}
+      },
+      "id": "8d7f4e4d-1975-5042-8600-8539bda817e0",
+      "name": "Size again",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2100,
+        900
+      ],
+      "notes": "The same sizing as 'Size causes', for the repaired answer.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Adds the measured numbers and the checks that need them. A cause must match gap orders and have more of them than\n// in a normal month. The whole month must reconcile with kpi_months; if not, the data changed under the run (a system\n// error, never sent to the agent).\nconst m = $('Each month').first().json;\nconst c = $('Check repaired answer').first().json;\nconst size = {};\nfor (const row of $input.all().map(i => i.json)) size[row.key] = typeof row.s === 'string' ? JSON.parse(row.s) : row.s;\nconst all = size.__all__;\nconst system_errors = [];\nif (!all?.ok) system_errors.push(`the month could not be measured: ${all?.error ?? 'no result'}`);\nelse if (all.gap_orders !== m.gap_orders || all.matched_orders !== m.counted)\n  system_errors.push(`sizing does not reconcile with kpi_months: ${all.matched_orders} orders / ${all.gap_orders} ` +\n                     `${m.gap_noun}, expected ${m.counted} / ${m.gap_orders}`);\n\nconst errors = [...c.errors];\nconst failed = new Set(errors.filter(e => e.item === 'cause').map(e => e.key));\nfor (const cause of c.answer.causes) {\n  if (failed.has(cause.cause_key)) continue;\n  const s = size[cause.cause_key];\n  const problems = [];\n  if (!s?.ok) problems.push(s?.error ?? 'it could not be measured');\n  else if (s.gap_orders === 0) problems.push(`the filter matches no ${m.gap_noun} this month`);\n  else if (s.excess_gap_orders <= 0) problems.push(`these orders were not ${m.gap_noun.replace(/ orders$/, '')} more often ` +\n                                                   'than in a normal month, so they do not explain the rise');\n  if (problems.length) { errors.push({ item: 'cause', key: cause.cause_key, problems }); failed.add(cause.cause_key); }\n}\nfor (const r of c.answer.recommendations ?? []) {\n  const lost = (r.closes_cause_keys ?? []).filter(k => failed.has(k));\n  if (lost.length && !errors.some(e => e.item === 'recommendation' && e.key === r.reco_key))\n    errors.push({ item: 'recommendation', key: r.reco_key, problems: [`closes a cause that was rejected: ${lost.join(', ')}`] });\n}\nreturn [{ json: { ...c, size, errors, system_errors, reconciled: system_errors.length === 0,\n                  passed: system_errors.length === 0 && errors.length === 0 } }];"
+      },
+      "id": "fe557854-8a9f-557b-a81a-61a0c65c1b26",
+      "name": "Read retry checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        900
+      ],
+      "notes": "The same as 'Read checks'. Items that still fail are dropped in 'Build rows'.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keeps the items that passed, fills the placeholders with the measured numbers, ranks causes and actions by the\n// points they recover, and builds the staging rows plus one ops.agent_logs row.\nconst m = $('Each month').first().json;\nconst run = $('Settings').first().json;\nconst r = $input.first().json;\n// n8n's Postgres node fills {{ }} with String.replace, which reads $' $& $` $$ in the value as patterns, so a\n// literal never contains a $: it is written as chr(36), which gives the same text.\nconst lit = v => { const s = String(v).replace(/'/g, \"''\");\n                   return s.includes('$') ? `(${s.split('$').map(p => `'${p}'`).join(' || chr(36) || ')})` : `'${s}'`; };\nconst pct = v => v == null ? 'n/a' : (100 * Number(v)).toFixed(1) + '%';\nconst int = v => v == null ? 'n/a' : Number(v).toLocaleString('en-US');\nconst label = new Date(m.month + 'T00:00:00Z').toLocaleString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' });\nconst change = m.prev_orders ? Math.round(100 * (m.orders / m.prev_orders - 1)) : null;\nconst monthValues = {\n  month: label, month_rate: pct(m.rate), month_baseline_rate: pct(m.baseline_rate), orders: int(m.orders),\n  prev_orders: int(m.prev_orders), orders_change: change == null ? 'n/a' : `${change > 0 ? '+' : ''}${change}%`,\n};\nconst causeValues = s => ({ ...monthValues,\n  rate: pct(s.rate), baseline_rate: pct(s.baseline_rate), matched_orders: int(s.matched_orders),\n  gap_orders: int(s.gap_orders), share_of_gap: pct(s.share_of_gap), excess_gap_orders: int(s.excess_gap_orders),\n  points_recovered: Number(s.points_recovered).toFixed(1), impact_recovered: Number(s.impact_recovered ?? 0).toFixed(2) });\nconst fill = (text, values) => String(text).replace(/\\{([a-z_]+)\\}/g, (_, k) => values[k] ?? `{${k}}`);\nconst failed = (item, key) => r.errors.some(e => e.item === item && e.key === key);\nconst a = r.answer;\n\nconst causes = a.causes.filter(c => !failed('cause', c.cause_key))\n  .map(c => ({ ...c, s: r.size[c.cause_key] }))\n  .sort((x, y) => y.s.points_recovered - x.s.points_recovered);\nconst points = Object.fromEntries(causes.map(c => [c.cause_key, c.s.points_recovered]));\nconst recos = (a.recommendations ?? []).filter(x => !failed('recommendation', x.reco_key))\n  .map(x => ({ ...x, points: Math.max(...x.closes_cause_keys.map(k => points[k])) }))\n  .sort((x, y) => y.points - x.points);\nconst ruled = (a.ruled_out ?? []).filter((x, i) => !failed('ruled_out', x.factor || `ruled_out_${i + 1}`));\n\nconst drill = c => Object.fromEntries(['customer_state', 'seller_state', 'cross_state', 'seller_shipped_late',\n  'multi_seller', 'category', 'seller_id'].map(col => {\n    const f = c.filter.find(x => x.column === col && x.op === '=');\n    const v = f == null ? null : f.value === true ? 'yes' : f.value === false ? 'no' : String(f.value);\n    return [`f_${col}`, v];\n  }));\nconst status = causes.length === 0 ? 'not_explained' : r.errors.length ? 'partly_explained' : 'explained';\nconst headline = !failed('what_happened', 'what_happened') && a.what_happened\n  ? fill(a.what_happened, monthValues)\n  : `${m.name} reached ${monthValues.month_rate} in ${label}, against ${monthValues.month_baseline_rate} in a normal month.`;\n\nconst base = { run_id: run.run_id, kpi_id: m.kpi_id, month: m.month };\nconst summary = { ...base, kpi_name: m.name, headline, rate: m.rate, baseline_rate: m.baseline_rate, orders: m.orders,\n                  prev_orders: m.prev_orders, causes: causes.length, status };\nconst causeRows = causes.map((c, i) => ({ ...base, kind: 'cause', cause_key: c.cause_key, cause_name: c.cause_name,\n  explanation: fill(c.explanation, causeValues(c.s)), cause_filter: c.filter, supporting_cuts: c.supporting_cuts,\n  matched_orders: c.s.matched_orders, gap_orders: c.s.gap_orders, rate: c.s.rate, baseline_rate: c.s.baseline_rate,\n  share_of_gap: c.s.share_of_gap, points_recovered: c.s.points_recovered, impact_recovered: c.s.impact_recovered,\n  rank: i + 1, ...drill(c) }));\nconst slug = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 50) || 'factor';\nconst ruledRows = ruled.map((x, i) => ({ ...base, kind: 'ruled_out', cause_key: `${slug(x.factor)}_${i + 1}`,\n  cause_name: x.factor, explanation: fill(x.reason, monthValues), supporting_cuts: x.supporting_cuts }));\nconst names = Object.fromEntries(causes.map(c => [c.cause_key, c.cause_name]));\nconst recoRows = recos.map((x, i) => ({ ...base, reco_key: x.reco_key, lever: x.lever,\n  action: fill(x.action, { ...monthValues, points_recovered: Number(x.points).toFixed(1) }),\n  closes_cause_keys: x.closes_cause_keys, closes_cause_names: x.closes_cause_keys.map(k => names[k]).join('; '),\n  points_recovered: x.points, rank: i + 1 }));\n\nconst dropped = r.errors.map(e => `${e.item} \"${e.key}\" (${e.problems.join('; ')})`);\nconst log = {\n  run_id: run.run_id, agent: 'insights', action: 'explain_month', source: `${m.kpi_id} ${m.month.slice(0, 7)}`,\n  target_table: 'analytics.insight_causes', status: status === 'explained' ? 'success' : 'warning',\n  rows_read: null, rows_written: 1 + causeRows.length + ruledRows.length + recoRows.length, duration_ms: null,\n  reason: `${m.name} ${label}: ${causes.length} cause${causes.length === 1 ? '' : 's'}, ${ruledRows.length} ruled out, ` +\n          `${recoRows.length} action${recoRows.length === 1 ? '' : 's'}` +\n          (r.attempt === 2 ? \", after the agent's repair try\" : '') +\n          (dropped.length ? `. Dropped: ${dropped.join('; ')}` : ''),\n  details: { attempt: r.attempt, answer: a, dropped: r.errors,\n             causes: causes.map(c => ({ key: c.cause_key, filter: c.filter, size: c.s })) },\n};\nconst insert = (table, row) => {\n  const cols = Object.keys(row);\n  return `insert into ${table} (${cols.join(', ')}) select ${cols.join(', ')} ` +\n         `from jsonb_populate_record(null::${table}, ${lit(JSON.stringify(row))}::jsonb);`;\n};\nconst save_sql = [\n  insert('insights.stage_summary', summary),\n  ...causeRows.map(x => insert('insights.stage_causes', x)),\n  ...ruledRows.map(x => insert('insights.stage_causes', x)),\n  ...recoRows.map(x => insert('insights.stage_recommendations', x)),\n  insert('ops.agent_logs', log),\n  'select 1 as saved;',\n].join('\\n');\nreturn [{ json: { status, causes: causes.length, save_sql } }];"
+      },
+      "id": "ace11494-c4cc-5a8b-96d4-970fd72dc77a",
+      "name": "Build rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        460
+      ],
+      "notes": "Keeps the items that passed, fills every placeholder with the measured numbers, ranks causes and actions by points recovered and sets the drill-down columns (f_*) from the cause filter. Builds the staging rows and an ops.agent_logs row with the answer and anything dropped.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Stage this month's rows (published together at the end of the run) and log the month in ops.agent_logs\n{{ $json.save_sql }}",
+        "options": {}
+      },
+      "id": "959f3c4a-af1e-52d0-a322-86292b01d009",
+      "name": "Save month",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3220,
+        460
+      ],
+      "notes": "Writes the month's rows into insights.stage_* and its log row. Nothing is visible on the dashboard until the run publishes.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// The month does not reconcile: the analytics tables changed while the run was going, or the KPI settings are wrong\nconst run = $('Settings').first().json;\nconst m = $('Each month').first().json;\nconst r = $('Read checks').first().json;\nreturn [{ json: {\n  run_id: run.run_id, agent: 'insights', action: 'run_complete', source: null, target_table: null,\n  status: 'failed', rows_read: null, rows_written: null, duration_ms: null,\n  reason: `Stopped at ${m.kpi_id} ${m.month.slice(0, 7)}: ${r.system_errors.join('; ')}. Nothing was published: ` +\n          'the insight tables still hold the last good run.',\n  details: JSON.stringify({ kpi_id: m.kpi_id, month: m.month, system_errors: r.system_errors }),\n} }];"
+      },
+      "id": "09712c29-6160-5e85-8752-c6f5f44014bc",
+      "name": "Failure log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2760,
+        700
+      ],
+      "notes": "Builds the run_complete row with status 'failed': which month did not reconcile and why.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "236f844f-d3c1-5db5-a188-2ad69a3482e8",
+      "name": "Log failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2980,
+        700
+      ],
+      "notes": "Writes the failure row into ops.agent_logs.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "errorType": "errorMessage",
+        "errorMessage": "={{ $('Failure log row').first().json.reason }}"
+      },
+      "id": "1cef2bb9-c658-5bcf-8d82-e004bf7b26b5",
+      "name": "Stop run",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        3200,
+        700
+      ],
+      "notes": "Stops the workflow with an error, so the orchestrator sees the stage failed. Nothing is published: the dashboard keeps the last good run.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Staged rows → analytics.insight_* in one transaction. A run over every month also removes months that no longer move.\nselect insights.publish('{{ $('Settings').first().json.run_id }}', {{ $('Settings').first().json.full }}) as months;",
+        "options": {}
+      },
+      "id": "73c1d827-0cd7-59ce-85eb-5c7ac61b099d",
+      "name": "Publish insights",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        100
+      ],
+      "executeOnce": true,
+      "notes": "insights.publish: moves every staged row into analytics.insight_summary, insight_causes and insight_recommendations in one transaction, and records it in analytics.refresh_status.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- What this run published\nselect kpi_id, to_char(month, 'YYYY-MM') as month, status, causes\nfrom analytics.insight_summary\nwhere run_id = '{{ $('Settings').first().json.run_id }}'\norder by kpi_id, month;",
+        "options": {}
+      },
+      "id": "d8a4de5f-8cd1-52a1-8cf4-71f4c90e700a",
+      "name": "Run summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        100
+      ],
+      "alwaysOutputData": true,
+      "notes": "Reads what this run published from analytics.insight_summary.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const run = $('Settings').first().json;\nconst months = $input.all().map(i => i.json).filter(x => x.month);\nconst by = s => months.filter(x => x.status === s).length;\nreturn [{ json: {\n  run_id: run.run_id, agent: 'insights', action: 'run_complete', source: null, target_table: null,\n  status: by('explained') === months.length ? 'success' : 'warning', rows_read: null, rows_written: months.length,\n  duration_ms: null,\n  reason: `${months.length} month${months.length === 1 ? '' : 's'} explained and published (` +\n          months.map(x => `${x.kpi_id} ${x.month}: ${x.causes} cause${x.causes === 1 ? '' : 's'}`).join(', ') + ')' +\n          (by('partly_explained') ? `; ${by('partly_explained')} with items dropped` : '') +\n          (by('not_explained') ? `; ${by('not_explained')} without a cause that passed` : ''),\n  details: JSON.stringify({ months, full: run.full }),\n} }];"
+      },
+      "id": "bfa8ea45-9f1e-582f-8cb5-ca1679779c16",
+      "name": "Run log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        100
+      ],
+      "notes": "Builds the final ops.agent_logs row: the months published, their causes and any dropped items.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "01e077a7-c1f7-5828-9d72-b4db61776617",
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        100
+      ],
+      "notes": "Writes the run's final row into ops.agent_logs (action 'run_complete').",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "content": "## Explain stage · how it works\n\n1. **Find the months that moved** (*Find moved months*, no AI): `insights.kpi_months` compares each KPI month with its baseline (median of the 3 months before). A month moves at ≥ 1.5× and ≥ 2 points above it.\n2. **Break the KPI down** (*Run breakdowns*): totals by every approved column and pair. Only totals go to the AI, never single orders.\n3. **Explain agent**: what happened, what the data rules out, causes (each a **filter on approved columns**) and one or two actions per cause, from a fixed list of levers. No numbers: placeholders only.\n4. **Check and measure** (no AI): `insights.size_cause` measures every cause. Items that break a rule, match nothing or don't explain the rise get **one repair try**, then they are dropped. If the month doesn't reconcile, the run **stops**.\n5. **Publish**: placeholders are filled with the measured numbers, and all months go to `analytics.insight_*` in one transaction. Metabase reads them; the cause filter opens the drill-down.\n\nEvery answer, check and dropped item is in `ops.agent_logs` (agent = 'insights').",
+        "height": 480,
+        "width": 1300,
+        "color": 5
+      },
+      "id": "6e65c310-86b6-5b39-9e23-63b6c9477bcb",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -460
+      ]
+    }
+  ],
+  "connections": {
+    "Run explain": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Refresh order facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refresh order facts": {
+      "main": [
+        [
+          {
+            "node": "Find moved months",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find moved months": {
+      "main": [
+        [
+          {
+            "node": "Each month",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Each month": {
+      "main": [
+        [
+          {
+            "node": "Publish insights",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Run breakdowns",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish insights": {
+      "main": [
+        [
+          {
+            "node": "Run summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run summary": {
+      "main": [
+        [
+          {
+            "node": "Run log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run log row": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run breakdowns": {
+      "main": [
+        [
+          {
+            "node": "Build prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build prompt": {
+      "main": [
+        [
+          {
+            "node": "Explain agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explain agent": {
+      "main": [
+        [
+          {
+            "node": "Check answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check answer": {
+      "main": [
+        [
+          {
+            "node": "Size causes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Size causes": {
+      "main": [
+        [
+          {
+            "node": "Read checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read checks": {
+      "main": [
+        [
+          {
+            "node": "Reconciled?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconciled?": {
+      "main": [
+        [
+          {
+            "node": "Passed?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Failure log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Passed?": {
+      "main": [
+        [
+          {
+            "node": "Build rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Repair prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explain model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Explain agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explain output format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Explain agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair prompt": {
+      "main": [
+        [
+          {
+            "node": "Repair agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair agent": {
+      "main": [
+        [
+          {
+            "node": "Check repaired answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check repaired answer": {
+      "main": [
+        [
+          {
+            "node": "Size again",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Size again": {
+      "main": [
+        [
+          {
+            "node": "Read retry checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read retry checks": {
+      "main": [
+        [
+          {
+            "node": "Build rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Repair agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair output format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Repair agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build rows": {
+      "main": [
+        [
+          {
+            "node": "Save month",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save month": {
+      "main": [
+        [
+          {
+            "node": "Each month",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Failure log row": {
+      "main": [
+        [
+          {
+            "node": "Log failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log failure": {
+      "main": [
+        [
+          {
+            "node": "Stop run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

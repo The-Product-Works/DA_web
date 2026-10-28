@@ -1,0 +1,169 @@
+{
+  "id": "olistMockApi0001",
+  "name": "Mock API · Olist payments & reviews",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "olist-mock-api",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "cd59482b-8caf-5772-8257-388c7f561e3f",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "ea3e4138-b3c3-5968-bdaf-3dbfae7700aa",
+      "notes": "The API's address: GET /webhook/olist-mock-api?source=payments|reviews&page=N&page_size=N. Answers through the 'Respond' node. The workflow must be published for the production URL to work.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// ==== Fill in once: Google Drive file IDs of payments.json and reviews.json ====\nconst FILE_IDS = {\n  payments: 'PASTE_DRIVE_FILE_ID_OF_payments.json',\n  reviews: 'PASTE_DRIVE_FILE_ID_OF_reviews.json',\n};\n// ===============================================================================\nconst source = $input.first().json.query.source;\nif (!FILE_IDS[source]) {\n  throw new Error(`Unknown source \"${source}\". Use ?source=payments or ?source=reviews`);\n}\nreturn [{ json: { source, file_id: FILE_IDS[source] } }];"
+      },
+      "id": "39ad24c1-43cc-5e66-87b7-0c38a7ca4641",
+      "name": "Pick file",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Checks the source parameter and picks the matching Google Drive file ID. Paste the IDs of payments.json and reviews.json at the top of this node. An unknown source returns an error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.file_id }}"
+        },
+        "options": {}
+      },
+      "id": "b6413dbc-129a-5f39-93a4-79108689a143",
+      "name": "Download JSON from Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Downloads the full JSON file for the requested source from Google Drive. Needs the Google Drive credential.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "options": {}
+      },
+      "id": "dff750e0-dffd-5d34-92ed-7ecf7e5e3d90",
+      "name": "Parse JSON",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        660,
+        300
+      ],
+      "notes": "Reads the downloaded file as JSON, so the records can be paged.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Return one page, like a real paginated API: ?source=payments&page=2&page_size=20000\nconst query = $('Webhook').first().json.query;\nconst source = $('Pick file').first().json.source;\nconst page = Math.max(1, parseInt(query.page ?? '1', 10) || 1);\nconst pageSize = Math.min(Math.max(parseInt(query.page_size ?? '20000', 10) || 20000, 1), 50000);\nconst records = $input.first().json.data[source] ?? [];\nconst totalPages = Math.max(1, Math.ceil(records.length / pageSize));\nreturn [{ json: {\n  source,\n  page,\n  page_size: pageSize,\n  total_pages: totalPages,\n  total: records.length,\n  data: records.slice((page - 1) * pageSize, page * pageSize),\n} }];"
+      },
+      "id": "a6248f47-1317-5db5-8903-95191467650c",
+      "name": "Return one page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Cuts out the requested page (default 20,000 records, max 50,000) and adds page, page_size, total_pages and total, like a real paginated API.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      },
+      "id": "1a72e540-195a-56cb-bb14-8f2b4094d240",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        300
+      ],
+      "notes": "Sends the page back to the caller as the HTTP response.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Pick file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick file": {
+      "main": [
+        [
+          {
+            "node": "Download JSON from Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download JSON from Drive": {
+      "main": [
+        [
+          {
+            "node": "Parse JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse JSON": {
+      "main": [
+        [
+          {
+            "node": "Return one page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Return one page": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

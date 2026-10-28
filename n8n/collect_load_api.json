@@ -1,0 +1,360 @@
+{
+  "id": "olistLoadApi0001",
+  "name": "Collection · Load API source",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "88529341-e778-55a0-b9a6-208863952631",
+      "name": "Start",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Entry point of this sub-workflow. It is not run by hand: 'Collection · Main' calls it once per source and passes that source's settings (source name, raw table, file ID / sheet tab / API URL, run ID, batch size).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep the source settings passed in by the main workflow and note the start time\nreturn [{ json: { ...$input.first().json, started_at: Date.now() } }];"
+      },
+      "id": "0341ba8d-9b9f-5428-ba21-a23ca56caa48",
+      "name": "Init",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Keeps the source settings passed in by the main workflow and adds started_at (the current time), used later to work out how long the load took. Later nodes read their settings from here with $('Init').",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Truncate and reload: running the collection twice never doubles the rows\nTRUNCATE TABLE raw.{{ $json.table }};",
+        "options": {}
+      },
+      "id": "9ecfc412-8dc1-5c81-b2f2-d5dc37c3b86d",
+      "name": "Truncate raw table",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Empties raw.<table> before loading (TRUNCATE). This makes the workflow safe to re-run: a second run replaces the data instead of doubling it. Only the table for this source is emptied.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Init').first().json.api_url }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "source",
+              "value": "={{ $('Init').first().json.api_source }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 300000,
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "page",
+                    "value": "={{ $pageCount + 1 }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ $response.body.page >= $response.body.total_pages }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50
+            }
+          }
+        }
+      },
+      "id": "1386faf4-3b84-5580-b45f-227013642f25",
+      "name": "Call API (all pages)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        300
+      ],
+      "notes": "Calls the API with ?source=… and follows its pages (page=1, 2, 3 …) until the response says page >= total_pages. Each page is one response holding up to 20,000 records in 'data'. Safety limit: 50 pages.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "data",
+        "options": {}
+      },
+      "id": "4dc12919-b3c8-5d51-a966-320ce9fff8d4",
+      "name": "Split records",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Splits each page's 'data' list into one item per record, so the rest of the workflow works with individual payments or reviews.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// API records can have renamed keys (paymentValue), missing keys or be empty {}.\n// Map each record to the fixed raw columns and keep the untouched record in raw_record.\nconst cfg = $('Init').first().json;\nreturn $input.all().map(item => {\n  const record = item.json;\n  const row = {};\n  for (const column of cfg.columns) {\n    const value = record[column];\n    row[column] = value === null || value === undefined ? null : String(value);\n  }\n  row.raw_record = JSON.stringify(record);\n  row._run_id = cfg.run_id;\n  return { json: row };\n});"
+      },
+      "id": "3b5228cf-f25d-5175-9d18-d7084e0c8129",
+      "name": "Prepare rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "notes": "Maps each JSON record onto the fixed raw columns (listed in the main workflow's 'Sources' node), turning values into text, and stores the untouched record in raw_record. Records with a renamed key (e.g. paymentValue) or a missing key get null in that column; the original is still in raw_record for the agents to spot. Empty {} records are kept too.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "batchSize": "={{ $('Init').first().json.batch_size }}",
+        "options": {}
+      },
+      "id": "4ac9566b-387d-58bd-b46c-727002e00178",
+      "name": "Insert in batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1540,
+        300
+      ],
+      "notes": "Loop Over Items. Sends the rows to Supabase a batch at a time (2,000 rows; 5,000 for geolocation) instead of all at once, which keeps memory use and query size down. 'loop' output = next batch to insert; 'done' output = all batches finished.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "raw"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $('Init').first().json.table }}"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "61310854-a718-5ae0-a91c-2994af063db1",
+      "name": "Insert into raw table",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        400
+      ],
+      "notes": "Inserts the current batch into raw.<table>. Columns are mapped automatically, because the field names match the raw table's column names exactly. Loops back to 'Insert in batches' for the next batch.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// One log row for this source. rows_read must equal rows_written, otherwise a batch failed quietly.\nconst cfg = $('Init').first().json;\nconst rowsRead = $('Prepare rows').all().length;\nconst rowsWritten = $input.all().length;\nreturn [{ json: {\n  run_id: cfg.run_id,\n  agent: 'collection',\n  action: 'load',\n  source: cfg.source,\n  target_table: `raw.${cfg.table}`,\n  status: rowsRead === rowsWritten ? 'success' : 'warning',\n  rows_read: rowsRead,\n  rows_written: rowsWritten,\n  duration_ms: Date.now() - cfg.started_at,\n  reason: `Loaded ${cfg.label} (${cfg.type}) into raw.${cfg.table}`,\n  details: JSON.stringify({ type: cfg.type, label: cfg.label }),\n} }];"
+      },
+      "id": "9dbcbac5-970f-582c-9716-c0f46f976f3a",
+      "name": "Summarise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        160
+      ],
+      "notes": "Builds the log row for this load: rows read from the source vs rows written to Supabase, how long it took, and status. Status is 'warning' if the two counts differ, which means a batch failed quietly.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "a22a05a4-ec75-5dab-ac64-8049c92318ce",
+      "name": "Write agent log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1980,
+        160
+      ],
+      "notes": "Writes the load's log row into ops.agent_logs (FR-C4). One row per source per run.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Return one small item to the main workflow (never the loaded rows themselves)\nconst summary = $('Summarise').first().json;\nconst cfg = $('Init').first().json;\nreturn [{ json: { ...summary, table: cfg.table, type: cfg.type, label: cfg.label, failed: false } }];"
+      },
+      "id": "54c0a974-94b1-57cb-b95d-317fbfa42412",
+      "name": "Return result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        160
+      ],
+      "notes": "Returns one short summary item to the main workflow. The loaded rows themselves are never returned, because sending a million rows back would use a lot of memory.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Start": {
+      "main": [
+        [
+          {
+            "node": "Init",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init": {
+      "main": [
+        [
+          {
+            "node": "Truncate raw table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Truncate raw table": {
+      "main": [
+        [
+          {
+            "node": "Call API (all pages)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call API (all pages)": {
+      "main": [
+        [
+          {
+            "node": "Split records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split records": {
+      "main": [
+        [
+          {
+            "node": "Prepare rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare rows": {
+      "main": [
+        [
+          {
+            "node": "Insert in batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert in batches": {
+      "main": [
+        [
+          {
+            "node": "Summarise",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Insert into raw table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert into raw table": {
+      "main": [
+        [
+          {
+            "node": "Insert in batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarise": {
+      "main": [
+        [
+          {
+            "node": "Write agent log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write agent log": {
+      "main": [
+        [
+          {
+            "node": "Return result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

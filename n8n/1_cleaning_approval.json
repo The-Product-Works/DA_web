@@ -1,0 +1,365 @@
+{
+  "id": "olistCleanAppr01",
+  "name": "Cleaning · Approve rules",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "olist-cleaning-approval",
+        "formTitle": "Approve cleaning rules",
+        "formDescription": "The cleaning agent proposed rules that delete rows or change what values mean. On the next page, approve or reject each one. Rejected rules are not applied, and the values they would have fixed become empty.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Your name",
+              "placeholder": "e.g. Project owner",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {
+          "buttonLabel": "Show the rules"
+        }
+      },
+      "id": "34f23f5e-e0f8-5227-8eeb-d1744e707e55",
+      "name": "Open approval form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "6af6ffbc-5202-5e98-a04b-5e462d626712",
+      "notes": "The approver starts here. Open the form's Production URL (http://localhost:5678/form/olist-cleaning-approval); the workflow must be published. Asks for the approver's name first.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Every rule waiting for a decision, plus the cleaning run that is waiting for them\nselect r.rule_id, r.source, r.rule_type, r.column_name, r.params, r.reason, r.confidence, r.risk_reason,\n       r.rows_affected, r.examples, a.run_id as waiting_run_id, a.resume_url\nfrom ops.cleaning_rules r\nleft join lateral (select run_id, resume_url from ops.cleaning_approvals\n                   where status = 'waiting' order by created_at desc limit 1) a on true\nwhere r.status = 'pending'\norder by r.source, r.rule_order;",
+        "options": {}
+      },
+      "id": "c486d73b-235f-507c-ba8f-380b469dbb9a",
+      "name": "Get pending rules",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        220,
+        300
+      ],
+      "alwaysOutputData": true,
+      "notes": "Reads every rule with status 'pending' and the cleaning run that is waiting for them.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// One block per risky rule: what it does, rows affected, examples from the dry run, and an Approve / Reject choice\nconst rules = $input.all().map(i => i.json).filter(r => r.rule_id);\nconst esc = v => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst show = v => esc(v === null || v === undefined ? 'null' : typeof v === 'string' ? `\"${v}\"` : JSON.stringify(v));\nif (rules.length === 0) {\n  return [{ json: { rules: [], form_fields: JSON.stringify([\n    { fieldType: 'html', html: '<p>Nothing is waiting for approval right now.</p>' }]) } }];\n}\nconst fields = [];\nrules.forEach((r, i) => {\n  const examples = (r.examples ?? []).map(e => 'before' in e\n    ? `<li><code>${show(e.before)}</code> → <code>${show(e.after)}</code></li>`\n    : `<li><code>${show(e)}</code> → removed</li>`).join('');\n  fields.push({ fieldType: 'html', html:\n    `<h3>Rule ${i + 1} · ${esc(r.source)}${r.column_name ? ` · ${esc(r.column_name)}` : ''}</h3>` +\n    `<p><b>${esc(r.rule_type)}</b> <code>${esc(JSON.stringify(r.params))}</code></p>` +\n    `<p>${esc(r.reason)}</p>` +\n    `<p>Rows affected in the dry run: <b>${r.rows_affected ?? '?'}</b> · agent confidence ${r.confidence} · ` +\n    `needs approval because it ${esc(r.risk_reason)}</p>` +\n    (examples ? `<ul>${examples}</ul>` : '') });\n  fields.push({ fieldLabel: `Rule ${i + 1}`, fieldType: 'radio', requiredField: true,\n                fieldOptions: { values: [{ option: 'Approve' }, { option: 'Reject' }] } });\n});\nreturn [{ json: { rules: rules.map(r => r.rule_id), run_id: rules[0].waiting_run_id, resume_url: rules[0].resume_url,\n                  form_fields: JSON.stringify(fields) } }];"
+      },
+      "id": "34773cdd-bdd0-52e9-983b-c0d1a5da7af9",
+      "name": "Build review page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Builds the review page as JSON: for each rule, a block with what it does, rows affected, examples from the dry run and why it needs approval, then an Approve / Reject choice.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "page",
+        "defineForm": "json",
+        "jsonOutput": "={{ $json.form_fields }}",
+        "options": {
+          "formTitle": "Risky cleaning rules",
+          "buttonLabel": "Save decisions"
+        }
+      },
+      "id": "69a2d86e-2f69-5b62-b2eb-e094f1713c81",
+      "name": "Review rules",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.3,
+      "position": [
+        660,
+        300
+      ],
+      "webhookId": "a510b36f-bfc4-5982-89f2-cafbe1445ccf",
+      "notes": "n8n Form page defined by the JSON from 'Build review page'. Every choice is required.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the answers into one decision per rule. 'Rule 1', 'Rule 2' ... are the radio fields on the review page.\nconst page = $input.first().json;\nconst meta = $('Build review page').first().json;\nconst approver = $('Open approval form').first().json['Your name'];\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst decisions = meta.rules.map((rule_id, i) => ({ rule_id, status: page[`Rule ${i + 1}`] === 'Approve' ? 'approved' : 'rejected' }));\nreturn [{ json: {\n  run_id: meta.run_id ?? null,\n  resume_url: meta.resume_url ?? null,\n  approver,\n  decided: decisions.length,\n  approved: decisions.filter(d => d.status === 'approved').length,\n  rejected: decisions.filter(d => d.status === 'rejected').length,\n  values_sql: decisions.map(d => `(${lit(d.rule_id)}, ${lit(d.status)}, ${lit(approver)})`).join(',\\n       '),\n} }];"
+      },
+      "id": "50763d21-544d-5025-9000-d0a63316b037",
+      "name": "Read decisions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "notes": "Turns the answers into one decision per rule and prepares them for the database.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decided }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "94ab8a1f-cb41-56ae-8bd5-d55830dec4ba",
+      "name": "Anything decided?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        300
+      ],
+      "notes": "true → save the decisions and wake up the cleaning run. false → nothing was pending.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Store every decision, and mark the waiting run as answered\nupdate ops.cleaning_rules r\nset status = d.status, decided_by = d.decided_by, decided_at = now()\nfrom (values {{ $json.values_sql }}) as d(rule_id, status, decided_by)\nwhere r.rule_id = d.rule_id and r.status = 'pending';\nupdate ops.cleaning_approvals set status = 'submitted', submitted_at = now()\nwhere run_id = '{{ $json.run_id }}' and status = 'waiting';\nselect count(*)::int as decided from ops.cleaning_rules where decided_at > now() - interval '1 minute';",
+        "options": {}
+      },
+      "id": "623b6c47-f075-507d-afb5-9fcb641ee3be",
+      "name": "Save decisions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1320,
+        200
+      ],
+      "notes": "Writes approved / rejected, the approver and the time into ops.cleaning_rules, and marks the approval request as submitted.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $('Read decisions').first().json;\nreturn [{ json: {\n  run_id: d.run_id, agent: 'cleaning', action: 'approval', source: null, target_table: null,\n  status: 'success', rows_read: null, rows_written: null, duration_ms: null,\n  reason: `${d.approver} approved ${d.approved} and rejected ${d.rejected} risky cleaning rules`,\n  details: JSON.stringify({ approver: d.approver, approved: d.approved, rejected: d.rejected }),\n} }];"
+      },
+      "id": "291b5edd-8f9d-5c75-a5f0-a6a879f60c73",
+      "name": "Approval log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        200
+      ],
+      "notes": "Builds the ops.agent_logs row: who approved and rejected how many rules.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "2b957f4a-4bb7-5c28-874f-6c595a111d67",
+      "name": "Log approval",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1760,
+        200
+      ],
+      "notes": "Writes the approval log row into ops.agent_logs.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Read decisions').first().json.resume_url }}",
+        "options": {}
+      },
+      "id": "0c9455e1-b3a8-52a3-9c58-0ff780b07efb",
+      "name": "Continue cleaning run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1980,
+        200
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Calls the waiting cleaning run's resume URL, so it continues straight away. Continues on error (for example when the run already stopped waiting).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "text",
+        "completionTitle": "Thank you",
+        "completionMessage": "={{ $('Read decisions').first().json.decided ? `${$('Read decisions').first().json.approved} approved, ${$('Read decisions').first().json.rejected} rejected. The cleaning run continues.` : 'Nothing was waiting for approval.' }}",
+        "options": {}
+      },
+      "id": "ec7f87a7-60ff-59c9-b01b-85be9a1d5c72",
+      "name": "Done",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.3,
+      "position": [
+        2200,
+        300
+      ],
+      "webhookId": "86108e95-8500-51f6-b1bf-fa1c262d51fc",
+      "notes": "The last page the approver sees: how many rules were approved and rejected.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Open approval form": {
+      "main": [
+        [
+          {
+            "node": "Get pending rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get pending rules": {
+      "main": [
+        [
+          {
+            "node": "Build review page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build review page": {
+      "main": [
+        [
+          {
+            "node": "Review rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review rules": {
+      "main": [
+        [
+          {
+            "node": "Read decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read decisions": {
+      "main": [
+        [
+          {
+            "node": "Anything decided?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything decided?": {
+      "main": [
+        [
+          {
+            "node": "Save decisions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save decisions": {
+      "main": [
+        [
+          {
+            "node": "Approval log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval log row": {
+      "main": [
+        [
+          {
+            "node": "Log approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log approval": {
+      "main": [
+        [
+          {
+            "node": "Continue cleaning run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Continue cleaning run": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}

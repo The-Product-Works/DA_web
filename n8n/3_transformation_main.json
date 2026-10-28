@@ -1,0 +1,1064 @@
+{
+  "id": "olistTransMain01",
+  "name": "Transformation · Main",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "ea2b63d7-84ca-5fcb-8f5a-f7f04f1c8123",
+      "name": "Run transformation",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "notes": "Start here: click 'Execute workflow' to build and publish the analytics tables once. Run the cleaning stage first, so clean.* is filled. In Week 3 the orchestrator calls this instead.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 2 * * *"
+            }
+          ]
+        }
+      },
+      "id": "e8a66f08-c6a3-55cc-bfac-7fa646c47a90",
+      "name": "Every night",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        500
+      ],
+      "disabled": true,
+      "notes": "Schedule Trigger, 02:00 every night, switched off (disabled). In Week 3 the orchestrator runs the whole pipeline on a schedule instead; to run only this stage at night, enable this node and publish the workflow.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// ==== Settings ===============================================================\nconst ONLY = [];          // e.g. ['kpi_summary'] to build a few views; empty = all\nconst FRESH_SQL = false;  // true = ask the agent for new SQL even when a view already has SQL that passed\n// =============================================================================\n\nconst runId = 'transform_' + new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);\n\n// Business definitions. The agent gets them with every question; the reference SQL below follows them exactly.\nconst DEFINITIONS = [\n  \"A counted order is a row in clean.orders whose order_status is not null and not 'canceled' or 'unavailable', \" +\n    'and that has at least one row in clean.order_items. Every view counts only these orders.',\n  'Revenue = sum(coalesce(price, 0) + coalesce(freight_value, 0)) over the clean.order_items rows of counted orders.',\n  'orders = the number of distinct counted orders. customers = the number of distinct customer_unique_id ' +\n    '(from clean.customers) of counted orders.',\n  'avg_order_value = revenue / orders.',\n  'Round money and averages to 2 decimals with round(x, 2), once, on the final value.',\n];\n\nconst RELATIONSHIPS = [\n  'clean.order_items.order_id → clean.orders.order_id (an order has one or more items)',\n  'clean.orders.customer_id → clean.customers.customer_id (customer_unique_id identifies the person across orders)',\n  'clean.order_items.product_id → clean.products.product_id',\n  'clean.order_items.seller_id → clean.sellers.seller_id',\n  'clean.products.product_category_name → clean.category_translation.product_category_name ' +\n    '(English name in product_category_name_english)',\n  'clean.payments.order_id → clean.orders.order_id (an order can have several payments)',\n  'clean.reviews.order_id → clean.orders.order_id (an order can have more than one review)',\n  'Some IDs may have no match in the linked table after cleaning.',\n];\n\n// Building blocks of the reference SQL (the answer key). The agent never sees these.\nconst COUNTED = `select o.order_id, o.customer_id, o.order_purchase_timestamp from clean.orders o\n  where o.order_status is not null and o.order_status not in ('canceled', 'unavailable')\n    and exists (select 1 from clean.order_items i where i.order_id = o.order_id)`;\nconst ITEMS = `select i.order_id, i.product_id, coalesce(i.price, 0) + coalesce(i.freight_value, 0) as revenue\n  from clean.order_items i join (${COUNTED}) c on c.order_id = i.order_id`;\nconst WITH = `with c as (${COUNTED}), r as (${ITEMS})`;\nconst REVENUE = (where = '') => `${WITH} select sum(r.revenue) from r join c on c.order_id = r.order_id ${where}`;\n\n// One entry per view. columns: name → [type, meaning]. grain: the columns that make a row unique (none = one row).\n// indexes: built on the published analytics table, for the filters the dashboard uses.\nconst questions = [\n  { view: 'orders_wide',\n    question: 'One row per counted order with everything the dashboard filters and groups orders by: customer, ' +\n              'state, dates, delivery time, lateness, items, revenue, payment and review.',\n    columns: {\n      order_id: ['text', 'the order'],\n      customer_unique_id: ['text', 'the customer (null when the customer is unknown)'],\n      customer_city: ['text', \"the customer's city\"],\n      customer_state: ['text', \"the customer's state\"],\n      order_status: ['text', 'order_status'],\n      purchase_timestamp: ['timestamp', 'order_purchase_timestamp'],\n      purchase_month: ['date', \"date_trunc('month', order_purchase_timestamp)::date\"],\n      delivered_timestamp: ['timestamp', 'order_delivered_customer_date'],\n      estimated_delivery_date: ['timestamp', 'order_estimated_delivery_date'],\n      delivery_days: ['integer', 'order_delivered_customer_date::date - order_purchase_timestamp::date (null when not delivered)'],\n      is_late: ['boolean', 'order_delivered_customer_date::date > order_estimated_delivery_date::date (null when either is missing)'],\n      items: ['integer', 'number of order_items rows'],\n      revenue: ['numeric', 'revenue of the order'],\n      payment_value: ['numeric', 'sum of payment_value in clean.payments (null when there is no payment)'],\n      main_payment_type: ['text', 'payment_type of the largest payment; on a tie, the lowest payment_sequential (null when there is no payment)'],\n      review_score: ['numeric', 'average review_score of the reviews of the order (null when there is none)'] },\n    grain: ['order_id'],\n    notes: 'Keep orders whose customer is missing from clean.customers (customer columns null). Aggregate payments ' +\n           'and reviews per order before joining, so an order never repeats.',\n    indexes: [['purchase_month'], ['customer_state'], ['order_status']],\n    reference_sql: `${WITH},\n      items as (select order_id, count(*)::int as items, sum(revenue) as revenue from r group by order_id),\n      pay as (select order_id, sum(payment_value) as payment_value from clean.payments group by order_id),\n      main_pay as (select distinct on (order_id) order_id, payment_type from clean.payments\n                   order by order_id, payment_value desc nulls last, payment_sequential),\n      rev as (select order_id, round(avg(review_score), 2) as review_score from clean.reviews group by order_id)\n      select o.order_id, cu.customer_unique_id, cu.customer_city, cu.customer_state, o.order_status,\n             o.order_purchase_timestamp as purchase_timestamp,\n             date_trunc('month', o.order_purchase_timestamp)::date as purchase_month,\n             o.order_delivered_customer_date as delivered_timestamp,\n             o.order_estimated_delivery_date as estimated_delivery_date,\n             o.order_delivered_customer_date::date - o.order_purchase_timestamp::date as delivery_days,\n             o.order_delivered_customer_date::date > o.order_estimated_delivery_date::date as is_late,\n             it.items, round(it.revenue, 2) as revenue, round(p.payment_value, 2) as payment_value,\n             mp.payment_type as main_payment_type, rv.review_score\n      from c join clean.orders o on o.order_id = c.order_id\n           join items it on it.order_id = o.order_id\n           left join clean.customers cu on cu.customer_id = o.customer_id\n           left join pay p on p.order_id = o.order_id\n           left join main_pay mp on mp.order_id = o.order_id\n           left join rev rv on rv.order_id = o.order_id`,\n    reconcile: { column: 'revenue', expected_sql: REVENUE() } },\n\n  { view: 'order_items_wide',\n    question: 'One row per item of a counted order with everything the dashboard filters items by: month, state, ' +\n              'product, category, seller and revenue.',\n    columns: {\n      order_id: ['text', 'the order'],\n      order_item_id: ['integer', 'the item number within the order'],\n      purchase_month: ['date', \"date_trunc('month', order_purchase_timestamp)::date\"],\n      customer_state: ['text', \"the customer's state (null when the customer is unknown)\"],\n      product_id: ['text', 'the product'],\n      category: ['text', \"English category name; the Portuguese name when there is no translation; 'unknown' when the product or its category is missing\"],\n      seller_id: ['text', 'the seller'],\n      seller_state: ['text', \"the seller's state (null when the seller is unknown)\"],\n      price: ['numeric', 'price'],\n      freight_value: ['numeric', 'freight_value'],\n      revenue: ['numeric', 'coalesce(price, 0) + coalesce(freight_value, 0)'] },\n    grain: ['order_id', 'order_item_id'],\n    notes: 'Keep every item of a counted order: use left joins for customers, products, categories and sellers.',\n    indexes: [['purchase_month'], ['customer_state'], ['category'], ['seller_id'], ['order_id']],\n    reference_sql: `${WITH}\n      select i.order_id, i.order_item_id, date_trunc('month', c.order_purchase_timestamp)::date as purchase_month,\n             cu.customer_state, i.product_id,\n             coalesce(t.product_category_name_english, p.product_category_name, 'unknown') as category,\n             i.seller_id, s.seller_state, i.price, i.freight_value,\n             round(coalesce(i.price, 0) + coalesce(i.freight_value, 0), 2) as revenue\n      from clean.order_items i join c on c.order_id = i.order_id\n           left join clean.customers cu on cu.customer_id = c.customer_id\n           left join clean.products p on p.product_id = i.product_id\n           left join clean.category_translation t on t.product_category_name = p.product_category_name\n           left join clean.sellers s on s.seller_id = i.seller_id`,\n    reconcile: { column: 'revenue', expected_sql: REVENUE() } },\n\n  { view: 'kpi_summary',\n    question: 'What are the headline numbers: total revenue, orders, customers, average order value and average review score?',\n    columns: {\n      revenue: ['numeric', 'total revenue'],\n      orders: ['integer', 'number of counted orders'],\n      customers: ['integer', 'number of distinct customers (customer_unique_id)'],\n      avg_order_value: ['numeric', 'revenue / orders'],\n      avg_review_score: ['numeric', 'average review_score of the reviews of counted orders (ignore null scores)'] },\n    grain: [],\n    reference_sql: `${WITH}\n      select round((select sum(revenue) from r), 2) as revenue,\n             (select count(*) from c)::int as orders,\n             (select count(distinct cu.customer_unique_id) from c join clean.customers cu on cu.customer_id = c.customer_id)::int as customers,\n             round((select sum(revenue) from r) / nullif((select count(*) from c), 0), 2) as avg_order_value,\n             (select round(avg(rv.review_score), 2) from clean.reviews rv join c on c.order_id = rv.order_id) as avg_review_score`,\n    reconcile: { column: 'revenue', expected_sql: REVENUE() } },\n\n  { view: 'monthly_revenue',\n    question: 'How do revenue and orders develop month by month (by purchase date)?',\n    columns: {\n      month: ['date', \"first day of the purchase month: date_trunc('month', order_purchase_timestamp)::date\"],\n      orders: ['integer', 'counted orders purchased in that month'],\n      revenue: ['numeric', 'revenue of those orders'],\n      avg_order_value: ['numeric', 'revenue / orders for the month'] },\n    grain: ['month'],\n    indexes: [['month']],\n    notes: 'Leave out orders without a purchase date.',\n    reference_sql: `${WITH}\n      select date_trunc('month', c.order_purchase_timestamp)::date as month,\n             count(distinct c.order_id)::int as orders,\n             round(sum(r.revenue), 2) as revenue,\n             round(sum(r.revenue) / count(distinct c.order_id), 2) as avg_order_value\n      from c join r on r.order_id = c.order_id\n      where c.order_purchase_timestamp is not null\n      group by 1`,\n    reconcile: { column: 'revenue', expected_sql: REVENUE('where c.order_purchase_timestamp is not null') } },\n\n  { view: 'revenue_by_state',\n    question: 'How are revenue, orders and customers spread across the customer states?',\n    columns: {\n      customer_state: ['text', \"the customer's state (null when the order's customer is unknown)\"],\n      orders: ['integer', 'counted orders from that state'],\n      customers: ['integer', 'distinct customers (customer_unique_id) from that state'],\n      revenue: ['numeric', 'revenue of those orders'] },\n    grain: ['customer_state'],\n    notes: 'Keep orders whose customer is missing from clean.customers, in a row with customer_state null.',\n    reference_sql: `${WITH}\n      select cu.customer_state,\n             count(distinct c.order_id)::int as orders,\n             count(distinct cu.customer_unique_id)::int as customers,\n             round(sum(r.revenue), 2) as revenue\n      from c join r on r.order_id = c.order_id\n           left join clean.customers cu on cu.customer_id = c.customer_id\n      group by cu.customer_state`,\n    reconcile: { column: 'revenue', expected_sql: REVENUE() } },\n\n  { view: 'top_categories',\n    question: 'Which product categories bring in the most revenue?',\n    columns: {\n      category: ['text', \"English category name; the Portuguese name when there is no translation; 'unknown' when the product or its category is missing\"],\n      items_sold: ['integer', 'order_items rows of counted orders in this category'],\n      orders: ['integer', 'distinct counted orders with at least one item in this category'],\n      revenue: ['numeric', 'revenue of those items'],\n      revenue_rank: ['integer', 'rank() by revenue, highest first (1 = top category)'] },\n    grain: ['category'],\n    notes: 'Include every category, not only the top ones: the dashboard picks the top 10 with revenue_rank.',\n    reference_sql: `${WITH}\n      select coalesce(t.product_category_name_english, p.product_category_name, 'unknown') as category,\n             count(*)::int as items_sold,\n             count(distinct r.order_id)::int as orders,\n             round(sum(r.revenue), 2) as revenue,\n             rank() over (order by sum(r.revenue) desc)::int as revenue_rank\n      from r left join clean.products p on p.product_id = r.product_id\n             left join clean.category_translation t on t.product_category_name = p.product_category_name\n      group by 1`,\n    reconcile: { column: 'revenue', expected_sql: REVENUE() } },\n];\n\n// Stored SQL is used again only while the question, its columns and the definitions stay the same\nconst hash = s => [...s].reduce((h, ch) => (h * 33 + ch.charCodeAt(0)) >>> 0, 5381).toString(36);\n\nreturn questions\n  .filter(q => ONLY.length === 0 || ONLY.includes(q.view))\n  .map(q => ({ json: {\n    ...q, notes: q.notes ?? '', run_id: runId, fresh_sql: FRESH_SQL,\n    definitions: DEFINITIONS, relationships: RELATIONSHIPS,\n    spec_hash: hash(JSON.stringify([q.question, q.columns, q.grain, q.notes ?? '', DEFINITIONS])),\n    // What transform.validate_view checks the view against\n    spec: { columns: Object.fromEntries(Object.entries(q.columns).map(([c, [type]]) => [c, type])),\n            grain: q.grain, min_rows: 1, reference_sql: q.reference_sql, reconcile: q.reconcile },\n  } }));"
+      },
+      "id": "c29f9beb-8c49-5631-adcf-161f5e318ffb",
+      "name": "Questions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "notes": "Settings and the question catalogue. ONLY limits the run to a few views; FRESH_SQL = true asks the agent for new SQL even when a view already has SQL that passed. Each question has the view name, the columns it must return, its key (grain) and a hand-written reference SQL: the answer key the agent's view must match, plus the indexes of its published table. The business definitions (which orders count, what revenue is) are shared by all questions. To add a view, add one entry.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "46dc0f61-a8d7-5cdd-8831-4bff3a8080a7",
+      "name": "Each question",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        440,
+        300
+      ],
+      "notes": "Loop Over Items, one question at a time. 'loop' output = build the next view; 'done' output (every view passed) = publish the tables.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- The latest SQL for this view that passed validation (no row = never built)\nselect model_id, run_id, spec_hash, select_sql, explanation, assumptions\nfrom ops.transform_models\nwhere view_name = '{{ $('Each question').first().json.view }}' and status = 'passed'\norder by created_at desc\nlimit 1;",
+        "options": {}
+      },
+      "id": "cd877fb1-7d70-5b2f-8e07-88f2e7e4c19f",
+      "name": "Get stored SQL",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        660,
+        460
+      ],
+      "alwaysOutputData": true,
+      "notes": "Looks up the latest SQL for this view that passed validation, in ops.transform_models. No row means the view was never built ('Always Output Data' is on).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- The columns of every clean table, so the agent writes SQL against what is really there\nselect string_agg(format('clean.%s (%s)', table_name, cols), E'\\n' order by table_name) as schema_text\nfrom (select table_name, string_agg(column_name || ' ' || data_type, ', ' order by ordinal_position) as cols\n      from information_schema.columns\n      where table_schema = 'clean'\n      group by table_name) t;",
+        "options": {}
+      },
+      "id": "b60b746a-8609-5cf7-9f12-ee43b9fd5188",
+      "name": "Get schema",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        460
+      ],
+      "executeOnce": true,
+      "notes": "Reads the columns and types of every clean table from information_schema, so the agent sees the tables as they really are.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// The question, the columns the view must return, the business definitions and the clean schema.\n// No data rows are sent, and the reference SQL (the answer key) is never shown to the agent.\nconst q = $('Each question').first().json;\nconst stored = $('Get stored SQL').first().json;\nconst prompt = [\n  `Question: ${q.question}`,\n  `View: models.${q.view}`,\n  'Columns the view must return (name, type, meaning):',\n  ...Object.entries(q.columns).map(([c, [type, meaning]]) => `- ${c} (${type}): ${meaning}`),\n  q.grain.length ? `One row per ${q.grain.join(', ')}.` : 'Exactly one row.',\n  q.notes,\n  '',\n  'Business definitions:',\n  ...q.definitions.map(d => `- ${d}`),\n  '',\n  'Tables:',\n  $('Get schema').first().json.schema_text,\n  '',\n  'How the tables link:',\n  ...q.relationships.map(r => `- ${r}`),\n].filter(line => line !== '').join('\\n');\n// The agent is asked only when there is no SQL that passed before, the spec changed, or FRESH_SQL is on\nconst needsSql = q.fresh_sql || !stored.select_sql || stored.spec_hash !== q.spec_hash;\nreturn [{ json: { prompt, needs_sql: needsSql, stored_run_id: stored.run_id ?? null } }];"
+      },
+      "id": "57cc6ed6-cdf2-594f-9353-41413e77d551",
+      "name": "Build prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        460
+      ],
+      "notes": "Puts the question, the required columns, the business definitions, the clean schema and how the tables link into one prompt. No data rows and no reference SQL are sent. Also decides, without AI, whether the agent is needed: no stored SQL, the question changed, or FRESH_SQL.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needs_sql }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a8e05eb9-e514-5c38-9a23-0a0f22c9a148",
+      "name": "SQL needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        460
+      ],
+      "notes": "true → ask the Transformation agent. false → use the stored SQL (still validated again).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are the transformation agent in a data pipeline. You answer one business question with one\nPostgreSQL SELECT statement. The system saves it as a view in the models schema, then checks it: the columns, one\nrow per key, the revenue total against the source tables, and the numbers against a hand-written answer. If any check\nfails, the view is not changed. Views that pass are published as tables for the dashboard.\n\nRules for the SQL:\n- One SELECT (WITH ... SELECT is fine). No semicolon, no comments, nothing that writes or changes data.\n- Read only from the clean schema, and always write the schema: clean.orders, not orders.\n- Return exactly the columns asked for, with exactly those names, and no others.\n- Follow the business definitions exactly. They decide which orders count and how revenue is computed.\n- Joins can repeat rows (an order has several items, payments and reviews): use count(distinct ...) where needed, and\n  never sum revenue over a join that repeats items.\n- Join only along the links listed. Use left joins for lookups (customers, products, categories) so no revenue is lost.\n- Cast counts to integer (::int). Round with round(x, 2) on the final value; cast to numeric first if x is not numeric.\n- No ORDER BY or LIMIT: the dashboard sorts and picks.\n\nexplanation: two or three plain sentences for a business reader: which tables, which filters, how the numbers are\ncomputed. assumptions: anything the question left open that you decided (may be empty)."
+        }
+      },
+      "id": "fbae5596-243e-515b-b0aa-27ccf4f0ea9b",
+      "name": "Transformation agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1760,
+        300
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "AI agent (FR-T1). Writes one SELECT that answers the question, plus a plain explanation and its assumptions. It cannot run anything itself. Continues on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "maxOutputTokens": 16384,
+          "temperature": 0
+        }
+      },
+      "id": "ae3de070-a2cd-576e-ab91-5d75be63b906",
+      "name": "Transformation model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1720,
+        520
+      ],
+      "notes": "The LLM the Transformation agent uses (Gemini 2.5 Flash, temperature 0). Needs the Gemini credential, like the other agents.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"select_sql\": {\n      \"type\": \"string\",\n      \"description\": \"One SELECT statement, no semicolon\"\n    },\n    \"explanation\": {\n      \"type\": \"string\"\n    },\n    \"assumptions\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      }\n    }\n  },\n  \"required\": [\n    \"select_sql\",\n    \"explanation\",\n    \"assumptions\"\n  ]\n}"
+      },
+      "id": "63ca98ff-e67e-54a5-bebd-e823fd1beffe",
+      "name": "Transformation output format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        1900,
+        520
+      ],
+      "notes": "Structured Output Parser with a fixed JSON schema: select_sql, explanation, assumptions.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Use the SQL that passed in an earlier run (no AI call). It still goes through the guardrails and is validated\n// again on today's clean data.\nconst s = $('Get stored SQL').first().json;\nreturn [{ json: { origin: 'stored', output: { select_sql: s.select_sql, explanation: s.explanation,\n                                              assumptions: s.assumptions ?? [] } } }];"
+      },
+      "id": "09d517de-7bfa-525e-ad82-7b69a34c14e4",
+      "name": "Use stored SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        600
+      ],
+      "notes": "Passes on the SQL that passed in an earlier run, in the same shape as the agent's answer. No AI call.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Guardrails (deterministic, no AI): the SQL must be one read-only SELECT on the clean schema. Then build the script\n// that creates the view in models as the restricted role transform_agent and validates it, in one transaction.\nconst q = $('Each question').first().json;\nconst out = $input.first().json;\nconst origin = out.origin ?? 'agent';\nconst answer = out.output ?? {};\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst select = String(answer.select_sql ?? '').trim().replace(/;\\s*$/, '');\nconst found = re => [...new Set((select.match(re) ?? []).map(w => w.toLowerCase().replace(/\\s+/g, '')))];\n\nconst problems = [];\nif (!select) {\n  problems.push(out.error ? `the agent failed: ${out.error.message ?? out.error}` : 'no SQL was returned');\n} else {\n  if (!/^(select|with)\\b/i.test(select)) problems.push('it must start with SELECT or WITH');\n  if (select.includes(';')) problems.push('it must be a single statement (no semicolons)');\n  if (/--|\\/\\*/.test(select)) problems.push('it must not contain comments');\n  const writes = found(/\\b(insert|update|delete|merge|drop|alter|create|grant|revoke|truncate|copy|call|do|execute|vacuum|analyze|refresh|lock|comment|set|reset|listen|notify|prepare|into)\\b/gi);\n  if (writes.length) problems.push(`it must only read data (found: ${writes.join(', ')})`);\n  const schemas = found(/\\b(raw|ops|cleaning|transform|models|analytics|public|auth|storage|extensions|vault|pg_catalog|information_schema)\\s*\\./gi);\n  if (schemas.length) problems.push(`it may only read the clean schema (found: ${schemas.join(', ')})`);\n  if (/\\bpg_\\w+|\\b(current_setting|set_config|dblink\\w*|lo_\\w+)\\s*\\(/i.test(select)) problems.push('it must not use system functions');\n  if (!/\\bclean\\s*\\./i.test(select)) problems.push('it must read from the clean schema (write clean.<table>)');\n  if (select.length > 12000) problems.push('it is too long (over 12,000 characters)');\n}\n\nconst V = `models.${q.view}`;\nconst viewSql = `create view ${V} as\\n${select}`;\nconst script = problems.length\n  ? `do $guard$ begin raise exception 'guardrail: %', ${lit(problems.join('; '))}; end $guard$;`\n  : [\n      `set local statement_timeout = '120s';`,\n      `set local role transform_agent;`,\n      `drop view if exists ${V};`,\n      `${viewSql};`,\n      `reset role;`,\n      `select transform.validate_view(${lit(q.view)}, ${lit(JSON.stringify(q.spec))}::jsonb) as result;`,\n    ].join('\\n');\nreturn [{ json: { origin, attempt: 1, select_sql: select, view_sql: problems.length ? null : viewSql,\n                  explanation: answer.explanation ?? null, assumptions: answer.assumptions ?? [],\n                  guardrail_problems: problems, script } }];"
+      },
+      "id": "85990b5e-4d01-5f61-bb14-43034842b401",
+      "name": "Check SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        460
+      ],
+      "notes": "Guardrails, deterministic, no AI: one statement, starting with SELECT or WITH, no comments, no writing keywords, only the clean schema, no system functions. Builds the script that creates the view as role transform_agent and validates it. A failed guardrail becomes an error in the next node, so nothing runs.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Create the view as transform_agent and validate it, all in one transaction: if a guardrail or a check fails,\n-- everything rolls back and the previous version of the view stays\n{{ $json.script }}",
+        "options": {}
+      },
+      "id": "c387ca3d-1072-5130-89b6-2ac4da426d88",
+      "name": "Create and validate view",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2320,
+        460
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "One transaction (FR-T2, FR-T3): switch to role transform_agent (can only read clean.* and create views in models), replace models.<view>, switch back and run transform.validate_view: columns, row count, no duplicate keys, revenue equals the clean tables, numbers match the reference SQL. Any failure rolls the transaction back, so the previous view stays. Continues on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the outcome into an ops.transform_models row and an ops.agent_logs row. The SQL is logged either way (FR-T5).\nconst q = $('Each question').first().json;\nconst c = $('Check SQL').first().json;\nconst out = $input.first().json;\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst error = out.result ? null : String(out.message ?? out.error?.message ?? out.error ?? 'no result');\nlet result = out.result ?? null;\nif (!result && error.includes('view failed validation: ')) {\n  try { result = JSON.parse(error.slice(error.indexOf('{'))); } catch (e) { result = null; }\n}\nconst passed = result?.passed === true;\nconst checks = result?.checks ?? [];\nconst failed = checks.filter(x => !x.passed);\nconst why = passed ? null\n  : failed.length ? failed.map(x => `${x.check}: ${x.detail}`).join('; ')\n  : error.replace(/^guardrail: /, 'guardrail: the SQL was not run because ');\nconst final = passed || c.attempt === 2;\nconst from = { agent: 'the agent', repair: \"the agent's repair\", stored: 'an earlier run' }[c.origin];\n\nconst model = {\n  model_id: `${q.run_id}:${q.view}:${c.attempt}`, run_id: q.run_id, view_name: q.view, question: q.question,\n  spec_hash: q.spec_hash, attempt: c.attempt, origin: c.origin, select_sql: c.select_sql, view_sql: c.view_sql,\n  explanation: c.explanation, assumptions: c.assumptions, status: passed ? 'passed' : 'failed',\n  checks: result?.checks ?? null, error: why,\n};\nconst log = {\n  run_id: q.run_id, agent: 'transformation', action: 'build_view', source: q.view, target_table: `models.${q.view}`,\n  status: passed ? 'success' : final ? 'failed' : 'warning', rows_read: null, rows_written: result?.row_count ?? null,\n  duration_ms: null,\n  reason: passed\n    ? `models.${q.view} created from SQL by ${from}: ${result.row_count} row${result.row_count === 1 ? '' : 's'}, all ${checks.length} checks passed`\n    : `SQL by ${from} for models.${q.view} was rejected, the view is unchanged: ${why}` +\n      (final ? '' : '. The agent gets one try to fix it.'),\n  details: { attempt: c.attempt, origin: c.origin, sql: c.view_sql ?? c.select_sql, explanation: c.explanation,\n             assumptions: c.assumptions, checks: result?.checks ?? null },\n};\nconst insert = (table, row) => {\n  const cols = Object.keys(row);\n  return `insert into ${table} (${cols.join(', ')}) select ${cols.join(', ')} ` +\n         `from jsonb_populate_record(null::${table}, ${lit(JSON.stringify(row))}::jsonb);`;\n};\nreturn [{ json: {\n  passed, final, why, attempt: c.attempt, view: q.view,\n  examples: failed.find(x => x.check === 'matches reference')?.examples ?? [],\n  save_sql: `${insert('ops.transform_models', model)}\\n${insert('ops.agent_logs', log)}\\nselect 1 as saved;`,\n} }];"
+      },
+      "id": "c6c10a94-e5da-5438-b9c3-46502605b0b0",
+      "name": "Read result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2540,
+        460
+      ],
+      "notes": "Reads the checks (or the error) and prepares an ops.transform_models row and an ops.agent_logs row with the SQL, the explanation and every check (FR-T5).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Store the SQL with its checks in ops.transform_models and log the attempt in ops.agent_logs\n{{ $json.save_sql }}",
+        "options": {}
+      },
+      "id": "269ab54d-7dba-5236-be06-7acdb7329c08",
+      "name": "Save attempt",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2760,
+        460
+      ],
+      "notes": "Writes both rows.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Read result').first().json.passed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2cd57d4d-57bc-5871-b06d-0ce4231c28d8",
+      "name": "Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2980,
+        460
+      ],
+      "notes": "true → next question. false → give the agent one try to fix its SQL.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// One second chance (FR-T4): the agent sees its SQL and exactly why it was rejected\nconst r = $('Read result').first().json;\nconst prompt = [\n  $('Build prompt').first().json.prompt,\n  '',\n  'Your SQL for this view was rejected:',\n  $('Check SQL').first().json.select_sql || '(no SQL)',\n  '',\n  `Why: ${r.why}`,\n  r.examples.length ? `Rows that differ (what your view returned → what was expected):\\n${JSON.stringify(r.examples)}` : '',\n  '',\n  'Write corrected SQL that fixes this, following all the instructions above.',\n].join('\\n');\nreturn [{ json: { prompt } }];"
+      },
+      "id": "39362c2f-a285-5236-8656-a9a53fec3b13",
+      "name": "Repair prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        900
+      ],
+      "notes": "The original prompt, plus the rejected SQL, why it failed and up to 3 rows that differ from the expected result.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.prompt }}",
+        "hasOutputParser": true,
+        "options": {
+          "systemMessage": "You are the transformation agent in a data pipeline. You answer one business question with one\nPostgreSQL SELECT statement. The system saves it as a view in the models schema, then checks it: the columns, one\nrow per key, the revenue total against the source tables, and the numbers against a hand-written answer. If any check\nfails, the view is not changed. Views that pass are published as tables for the dashboard.\n\nRules for the SQL:\n- One SELECT (WITH ... SELECT is fine). No semicolon, no comments, nothing that writes or changes data.\n- Read only from the clean schema, and always write the schema: clean.orders, not orders.\n- Return exactly the columns asked for, with exactly those names, and no others.\n- Follow the business definitions exactly. They decide which orders count and how revenue is computed.\n- Joins can repeat rows (an order has several items, payments and reviews): use count(distinct ...) where needed, and\n  never sum revenue over a join that repeats items.\n- Join only along the links listed. Use left joins for lookups (customers, products, categories) so no revenue is lost.\n- Cast counts to integer (::int). Round with round(x, 2) on the final value; cast to numeric first if x is not numeric.\n- No ORDER BY or LIMIT: the dashboard sorts and picks.\n\nexplanation: two or three plain sentences for a business reader: which tables, which filters, how the numbers are\ncomputed. assumptions: anything the question left open that you decided (may be empty)."
+        }
+      },
+      "id": "42e8a037-1d42-569a-b974-492879d5c9ce",
+      "name": "Repair agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 1.7,
+      "position": [
+        1760,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "The same agent and instructions, asked to fix its SQL once. Continues on error.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {
+          "maxOutputTokens": 16384,
+          "temperature": 0
+        }
+      },
+      "id": "19024154-1557-5b24-940f-7fc054a4729b",
+      "name": "Repair model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1720,
+        1120
+      ],
+      "notes": "Same LLM as the Transformation model. Needs the Gemini credential.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"select_sql\": {\n      \"type\": \"string\",\n      \"description\": \"One SELECT statement, no semicolon\"\n    },\n    \"explanation\": {\n      \"type\": \"string\"\n    },\n    \"assumptions\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\"\n      }\n    }\n  },\n  \"required\": [\n    \"select_sql\",\n    \"explanation\",\n    \"assumptions\"\n  ]\n}"
+      },
+      "id": "cc4a4b75-3617-5604-9228-1b4ea81a2801",
+      "name": "Repair output format",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [
+        1900,
+        1120
+      ],
+      "notes": "Same JSON schema as the Transformation output format.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Guardrails (deterministic, no AI): the SQL must be one read-only SELECT on the clean schema. Then build the script\n// that creates the view in models as the restricted role transform_agent and validates it, in one transaction.\nconst q = $('Each question').first().json;\nconst out = $input.first().json;\nconst origin = out.origin ?? 'repair';\nconst answer = out.output ?? {};\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst select = String(answer.select_sql ?? '').trim().replace(/;\\s*$/, '');\nconst found = re => [...new Set((select.match(re) ?? []).map(w => w.toLowerCase().replace(/\\s+/g, '')))];\n\nconst problems = [];\nif (!select) {\n  problems.push(out.error ? `the agent failed: ${out.error.message ?? out.error}` : 'no SQL was returned');\n} else {\n  if (!/^(select|with)\\b/i.test(select)) problems.push('it must start with SELECT or WITH');\n  if (select.includes(';')) problems.push('it must be a single statement (no semicolons)');\n  if (/--|\\/\\*/.test(select)) problems.push('it must not contain comments');\n  const writes = found(/\\b(insert|update|delete|merge|drop|alter|create|grant|revoke|truncate|copy|call|do|execute|vacuum|analyze|refresh|lock|comment|set|reset|listen|notify|prepare|into)\\b/gi);\n  if (writes.length) problems.push(`it must only read data (found: ${writes.join(', ')})`);\n  const schemas = found(/\\b(raw|ops|cleaning|transform|models|analytics|public|auth|storage|extensions|vault|pg_catalog|information_schema)\\s*\\./gi);\n  if (schemas.length) problems.push(`it may only read the clean schema (found: ${schemas.join(', ')})`);\n  if (/\\bpg_\\w+|\\b(current_setting|set_config|dblink\\w*|lo_\\w+)\\s*\\(/i.test(select)) problems.push('it must not use system functions');\n  if (!/\\bclean\\s*\\./i.test(select)) problems.push('it must read from the clean schema (write clean.<table>)');\n  if (select.length > 12000) problems.push('it is too long (over 12,000 characters)');\n}\n\nconst V = `models.${q.view}`;\nconst viewSql = `create view ${V} as\\n${select}`;\nconst script = problems.length\n  ? `do $guard$ begin raise exception 'guardrail: %', ${lit(problems.join('; '))}; end $guard$;`\n  : [\n      `set local statement_timeout = '120s';`,\n      `set local role transform_agent;`,\n      `drop view if exists ${V};`,\n      `${viewSql};`,\n      `reset role;`,\n      `select transform.validate_view(${lit(q.view)}, ${lit(JSON.stringify(q.spec))}::jsonb) as result;`,\n    ].join('\\n');\nreturn [{ json: { origin, attempt: 2, select_sql: select, view_sql: problems.length ? null : viewSql,\n                  explanation: answer.explanation ?? null, assumptions: answer.assumptions ?? [],\n                  guardrail_problems: problems, script } }];"
+      },
+      "id": "7c0757ba-891e-5dcd-a706-8da38e44849e",
+      "name": "Check repaired SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2100,
+        900
+      ],
+      "notes": "The same guardrails as 'Check SQL', for the repaired SQL.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Create the view as transform_agent and validate it, all in one transaction: if a guardrail or a check fails,\n-- everything rolls back and the previous version of the view stays\n{{ $json.script }}",
+        "options": {}
+      },
+      "id": "c6b84fd1-df10-5a5b-ac6e-57c49ac547a2",
+      "name": "Create and validate again",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2320,
+        900
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "The same transaction as 'Create and validate view', for the repaired SQL.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the outcome into an ops.transform_models row and an ops.agent_logs row. The SQL is logged either way (FR-T5).\nconst q = $('Each question').first().json;\nconst c = $('Check repaired SQL').first().json;\nconst out = $input.first().json;\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst error = out.result ? null : String(out.message ?? out.error?.message ?? out.error ?? 'no result');\nlet result = out.result ?? null;\nif (!result && error.includes('view failed validation: ')) {\n  try { result = JSON.parse(error.slice(error.indexOf('{'))); } catch (e) { result = null; }\n}\nconst passed = result?.passed === true;\nconst checks = result?.checks ?? [];\nconst failed = checks.filter(x => !x.passed);\nconst why = passed ? null\n  : failed.length ? failed.map(x => `${x.check}: ${x.detail}`).join('; ')\n  : error.replace(/^guardrail: /, 'guardrail: the SQL was not run because ');\nconst final = passed || c.attempt === 2;\nconst from = { agent: 'the agent', repair: \"the agent's repair\", stored: 'an earlier run' }[c.origin];\n\nconst model = {\n  model_id: `${q.run_id}:${q.view}:${c.attempt}`, run_id: q.run_id, view_name: q.view, question: q.question,\n  spec_hash: q.spec_hash, attempt: c.attempt, origin: c.origin, select_sql: c.select_sql, view_sql: c.view_sql,\n  explanation: c.explanation, assumptions: c.assumptions, status: passed ? 'passed' : 'failed',\n  checks: result?.checks ?? null, error: why,\n};\nconst log = {\n  run_id: q.run_id, agent: 'transformation', action: 'build_view', source: q.view, target_table: `models.${q.view}`,\n  status: passed ? 'success' : final ? 'failed' : 'warning', rows_read: null, rows_written: result?.row_count ?? null,\n  duration_ms: null,\n  reason: passed\n    ? `models.${q.view} created from SQL by ${from}: ${result.row_count} row${result.row_count === 1 ? '' : 's'}, all ${checks.length} checks passed`\n    : `SQL by ${from} for models.${q.view} was rejected, the view is unchanged: ${why}` +\n      (final ? '' : '. The agent gets one try to fix it.'),\n  details: { attempt: c.attempt, origin: c.origin, sql: c.view_sql ?? c.select_sql, explanation: c.explanation,\n             assumptions: c.assumptions, checks: result?.checks ?? null },\n};\nconst insert = (table, row) => {\n  const cols = Object.keys(row);\n  return `insert into ${table} (${cols.join(', ')}) select ${cols.join(', ')} ` +\n         `from jsonb_populate_record(null::${table}, ${lit(JSON.stringify(row))}::jsonb);`;\n};\nreturn [{ json: {\n  passed, final, why, attempt: c.attempt, view: q.view,\n  examples: failed.find(x => x.check === 'matches reference')?.examples ?? [],\n  save_sql: `${insert('ops.transform_models', model)}\\n${insert('ops.agent_logs', log)}\\nselect 1 as saved;`,\n} }];"
+      },
+      "id": "8d479d14-7674-5e93-b91d-f2aff3b26dd8",
+      "name": "Read retry result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2540,
+        900
+      ],
+      "notes": "The same as 'Read result', for the second try.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- Store the SQL with its checks in ops.transform_models and log the attempt in ops.agent_logs\n{{ $json.save_sql }}",
+        "options": {}
+      },
+      "id": "0aefc63f-ef07-565a-b1dd-aa8ef3d70096",
+      "name": "Save retry",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2760,
+        900
+      ],
+      "notes": "Writes both rows for the second try.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Read retry result').first().json.passed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1e36d524-6579-5335-8521-de739cdcbb94",
+      "name": "Fixed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2980,
+        900
+      ],
+      "notes": "true → next question. false → log the failure and stop the run (FR-T4).",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// FR-T4: a view that still fails after the repair try stops the run\nconst q = $('Each question').first().json;\nconst r = $('Read retry result').first().json;\nreturn [{ json: {\n  run_id: q.run_id, agent: 'transformation', action: 'run_complete', source: null, target_table: null,\n  status: 'failed', rows_read: null, rows_written: null, duration_ms: null,\n  reason: `Stopped: models.${q.view} failed validation twice (${r.why}). Nothing was published: the analytics ` +\n          'tables still hold the last good run.',\n  details: JSON.stringify({ view: q.view, why: r.why }),\n} }];"
+      },
+      "id": "09712c29-6160-5e85-8752-c6f5f44014bc",
+      "name": "Failure log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3200,
+        1000
+      ],
+      "notes": "Builds the run_complete row with status 'failed': which view failed twice and why.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "236f844f-d3c1-5db5-a188-2ad69a3482e8",
+      "name": "Log failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3420,
+        1000
+      ],
+      "notes": "Writes the failure row into ops.agent_logs.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "errorType": "errorMessage",
+        "errorMessage": "={{ $('Failure log row').first().json.reason }}"
+      },
+      "id": "1cef2bb9-c658-5bcf-8d82-e004bf7b26b5",
+      "name": "Stop run",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        3640,
+        1000
+      ],
+      "notes": "Stops the workflow with an error (FR-T4), so the orchestrator (Week 3) sees the stage failed. Nothing is published, so the analytics tables (and the dashboard) keep the last good run.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// Every view passed: publish them all as analytics tables. One script, so one transaction: the dashboard switches\n// from the last good run to this one in a single step, never a mix of both.\nconst lit = v => `'${String(v).replace(/'/g, \"''\")}'`;\nconst sql = $('Questions').all().map(i => i.json).map(q =>\n  `select ${lit(q.view)} as table_name, transform.publish(${lit(q.view)}, ${lit(q.run_id)}, ` +\n  `${lit(JSON.stringify(q.indexes ?? []))}::jsonb) as row_count;`).join('\\n');\nreturn [{ json: { sql } }];"
+      },
+      "id": "6d210d71-13cf-5679-ab27-5db9f938de16",
+      "name": "Build publish SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        100
+      ],
+      "executeOnce": true,
+      "notes": "Builds one script that calls transform.publish for every view of this run.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- models.<view> → analytics.<view> for every view of this run, in one transaction\n{{ $json.sql }}",
+        "options": {}
+      },
+      "id": "0c59f158-9567-5b87-84dc-d19ac03312cd",
+      "name": "Publish tables",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        880,
+        100
+      ],
+      "notes": "One transaction: copies each models.<view> into the table analytics.<view> (emptied and refilled, so Metabase's questions keep working), adds its indexes, grants the reader role and records the time in analytics.refresh_status. If anything fails, every table keeps the last good run.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=-- The views this run built and validated\nselect view_name, origin, attempt, checks\nfrom ops.transform_models\nwhere run_id = '{{ $('Questions').first().json.run_id }}' and status = 'passed'\norder by created_at;",
+        "options": {}
+      },
+      "id": "d8a4de5f-8cd1-52a1-8cf4-71f4c90e700a",
+      "name": "Run summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        100
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "notes": "Reads the views this run built and validated from ops.transform_models.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "jsCode": "const run = $('Questions').first().json;\nconst views = $input.all().map(i => i.json).filter(v => v.view_name);\nconst repaired = views.filter(v => v.attempt === 2).length;\nconst published = $('Publish tables').all().map(i => i.json);\nreturn [{ json: {\n  run_id: run.run_id, agent: 'transformation', action: 'run_complete', source: null, target_table: null,\n  status: 'success', rows_read: null, rows_written: published.length, duration_ms: null,\n  reason: `${views.length} views validated (` + views.map(v => `${v.view_name}: ${v.origin}`).join(', ') + ')' +\n          (repaired ? `, ${repaired} after the agent's repair try` : '') + '. Published to analytics: ' +\n          published.map(p => `${p.table_name} ${p.row_count} rows`).join(', '),\n  details: JSON.stringify({ views: views.map(v => ({ view: v.view_name, origin: v.origin, attempt: v.attempt })),\n                            published }),\n} }];"
+      },
+      "id": "bfa8ea45-9f1e-582f-8cb5-ca1679779c16",
+      "name": "Run log row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        100
+      ],
+      "notes": "Builds the final ops.agent_logs row: which views were validated, how many needed a repair, and the row count of every published table.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "schema": {
+          "__rl": true,
+          "mode": "name",
+          "value": "ops"
+        },
+        "table": {
+          "__rl": true,
+          "mode": "name",
+          "value": "agent_logs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "01e077a7-c1f7-5828-9d72-b4db61776617",
+      "name": "Log run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1540,
+        100
+      ],
+      "notes": "Writes the run's final row into ops.agent_logs (action 'run_complete').",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "content": "## Transformation stage · how it works\n\n1. **Write SQL** (per question in *Questions*): the **Transformation agent** gets the question, the columns the view must return, the business definitions and the clean schema, and writes one SELECT. Views that passed before reuse their stored SQL (no AI call).\n2. **Guardrails** (*Check SQL*, no AI): one read-only SELECT on `clean.*`, nothing else.\n3. **Create + validate** in one transaction: the view is created in `models` as the restricted role `transform_agent`, then `transform.validate_view` checks columns, row count, duplicate keys, revenue against the clean tables and the numbers against a hand-written reference query. Any failure rolls back.\n4. **One repair try**: the agent sees why its SQL failed and tries again. Fails twice → the run **stops** and nothing is published.\n5. **Publish**: when every view passed, all of them are copied into **tables** in `analytics` in one transaction. Metabase reads only these, so the dashboard is ready whenever the pipeline last ran (e.g. at night).\n\nEvery SQL, with its checks, is in `ops.transform_models` and `ops.agent_logs`; `analytics.refresh_status` says when each table was published.",
+        "height": 480,
+        "width": 1300,
+        "color": 5
+      },
+      "id": "6e65c310-86b6-5b39-9e23-63b6c9477bcb",
+      "name": "Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -460
+      ]
+    }
+  ],
+  "connections": {
+    "Run transformation": {
+      "main": [
+        [
+          {
+            "node": "Questions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every night": {
+      "main": [
+        [
+          {
+            "node": "Questions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Questions": {
+      "main": [
+        [
+          {
+            "node": "Each question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Each question": {
+      "main": [
+        [
+          {
+            "node": "Build publish SQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get stored SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build publish SQL": {
+      "main": [
+        [
+          {
+            "node": "Publish tables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Publish tables": {
+      "main": [
+        [
+          {
+            "node": "Run summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get stored SQL": {
+      "main": [
+        [
+          {
+            "node": "Get schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get schema": {
+      "main": [
+        [
+          {
+            "node": "Build prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build prompt": {
+      "main": [
+        [
+          {
+            "node": "SQL needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SQL needed?": {
+      "main": [
+        [
+          {
+            "node": "Transformation agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Use stored SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transformation agent": {
+      "main": [
+        [
+          {
+            "node": "Check SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use stored SQL": {
+      "main": [
+        [
+          {
+            "node": "Check SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check SQL": {
+      "main": [
+        [
+          {
+            "node": "Create and validate view",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create and validate view": {
+      "main": [
+        [
+          {
+            "node": "Read result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read result": {
+      "main": [
+        [
+          {
+            "node": "Save attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save attempt": {
+      "main": [
+        [
+          {
+            "node": "Passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Passed?": {
+      "main": [
+        [
+          {
+            "node": "Each question",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Repair prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transformation model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Transformation agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transformation output format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Transformation agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair prompt": {
+      "main": [
+        [
+          {
+            "node": "Repair agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair agent": {
+      "main": [
+        [
+          {
+            "node": "Check repaired SQL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check repaired SQL": {
+      "main": [
+        [
+          {
+            "node": "Create and validate again",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create and validate again": {
+      "main": [
+        [
+          {
+            "node": "Read retry result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read retry result": {
+      "main": [
+        [
+          {
+            "node": "Save retry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save retry": {
+      "main": [
+        [
+          {
+            "node": "Fixed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fixed?": {
+      "main": [
+        [
+          {
+            "node": "Each question",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Failure log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Failure log row": {
+      "main": [
+        [
+          {
+            "node": "Log failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log failure": {
+      "main": [
+        [
+          {
+            "node": "Stop run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Repair agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repair output format": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Repair agent",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run summary": {
+      "main": [
+        [
+          {
+            "node": "Run log row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run log row": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
